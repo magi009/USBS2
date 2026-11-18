@@ -1,7 +1,6 @@
-// usbprobe 4 - Mapa de comandos de IDsInterface / IDsEndpoint en Switch 2.
-// libounce registra la interfaz bien, pero luego pide sus eventos con los
-// números de comando de la Switch 1 y uno falla con 0x4BB25. Aquí se prueba
-// cada número de comando y se anota cuáles devuelven un evento (handle).
+// usbprobe 5 - Mapa de comandos de IDsInterface en Switch 2, con una conexión
+// NUEVA para cada prueba (en la sonda 4 la primera llamada cerró la sesión y
+// contaminó todo lo demás con 0xF601).
 // Resultado en pantalla y en sdmc:/switch/usbprobe.log
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,25 +20,98 @@ static void out(const char *fmt, ...) {
     if (g_log) { fprintf(g_log, "%s\n", line); fflush(g_log); }
 }
 
-// Llama a un comando esperando un handle de vuelta (como Get*Event).
-static Result get_handle(Service *s, u32 cmd, Handle *h) {
-    *h = INVALID_HANDLE;
-    serviceAssumeDomain(s);
-    return serviceDispatch(s, cmd, .out_handle_attrs = { SfOutHandleAttr_HipcCopy }, .out_handles = h);
+typedef struct { Service root, ds, intf; } Ctx;
+
+// Abre usb:ds, Bind(2) y RegisterInterface(0) en una sesión nueva.
+static Result fresh(Ctx *c) {
+    memset(c, 0, sizeof(*c));
+    Result rc = smGetService(&c->root, "usb:ds");
+    if (R_FAILED(rc)) return rc;
+    rc = serviceConvertToDomain(&c->root);
+    if (R_FAILED(rc)) return rc;
+    serviceAssumeDomain(&c->root);
+    rc = serviceDispatch(&c->root, 0, .out_num_objects = 1, .out_objects = &c->ds);
+    if (R_FAILED(rc)) return rc;
+    const u32 cid = 2;
+    serviceAssumeDomain(&c->ds);
+    rc = serviceDispatchIn(&c->ds, 0, cid, .in_num_handles = 1, .in_handles = { CUR_PROCESS_HANDLE });
+    if (R_FAILED(rc)) return rc;
+    const u8 n = 0;
+    serviceAssumeDomain(&c->ds);
+    return serviceDispatchIn(&c->ds, 1, n, .out_num_objects = 1, .out_objects = &c->intf);
 }
 
-static void scan_handles(const char *what, Service *s, u32 from, u32 to, const u32 *skip, int nskip) {
-    for (u32 cmd = from; cmd <= to; cmd++) {
-        bool sk = false;
-        for (int i = 0; i < nskip; i++) if (skip[i] == cmd) sk = true;
-        if (sk) { out("  %s cmd %2u: (omitido)", what, cmd); continue; }
-        out("  %s cmd %2u: probando...", what, cmd);
-        Handle h;
-        Result rc = get_handle(s, cmd, &h);
-        bool got = R_SUCCEEDED(rc) && h != INVALID_HANDLE && h != 0;
-        out("  %s cmd %2u: 0x%X%s", what, cmd, rc, got ? "  <-- DEVUELVE HANDLE" : "");
-        if (got) svcCloseHandle(h);
+static void done(Ctx *c) {
+    if (c->intf.session) { serviceAssumeDomain(&c->intf); serviceClose(&c->intf); }
+    if (c->ds.session) { serviceAssumeDomain(&c->ds); serviceClose(&c->ds); }
+    if (c->root.session) serviceClose(&c->root);
+}
+
+static const char *tag(Result rc) {
+    if (rc == 0) return "OK";
+    if (rc == 0xF601) return "SESION CERRADA";
+    if (rc == 0x10601 || rc == 0x1A80 || rc == 0x11A0B) return "cmd desconocido?";
+    return "";
+}
+
+// Prueba un comando "Get*Event" (sin entrada, devuelve un handle).
+static void test_event(u32 cmd) {
+    Ctx c;
+    Result rc = fresh(&c);
+    if (R_FAILED(rc)) { out("  ev cmd %2u: preparar -> 0x%X", cmd, rc); done(&c); return; }
+    Handle h = INVALID_HANDLE;
+    serviceAssumeDomain(&c.intf);
+    rc = serviceDispatch(&c.intf, cmd, .out_handle_attrs = { SfOutHandleAttr_HipcCopy }, .out_handles = &h);
+    bool got = R_SUCCEEDED(rc) && h != INVALID_HANDLE && h != 0;
+    out("  ev cmd %2u: 0x%X %s%s", cmd, rc, tag(rc), got ? "  <-- DEVUELVE HANDLE" : "");
+    if (got) svcCloseHandle(h);
+    // ¿la sesión sigue viva después?
+    Handle h2 = INVALID_HANDLE;
+    serviceAssumeDomain(&c.ds);
+    Result alive = serviceDispatch(&c.ds, 2, .out_handle_attrs = { SfOutHandleAttr_HipcCopy }, .out_handles = &h2);
+    if (R_SUCCEEDED(alive) && h2 != INVALID_HANDLE) svcCloseHandle(h2);
+    if (alive == 0xF601) out("             (despues de esto la sesion quedo cerrada)");
+    done(&c);
+}
+
+static const u8 g_intf_desc[USB_DT_INTERFACE_SIZE] = {9, 4, 0, 0, 2, 0xFF, 0xFF, 0xFF, 0};
+
+// Prueba "AppendConfigurationData" con un número de comando y un tipo de buffer.
+static void test_append(u32 cmd, u32 attr, const char *attr_name, bool with_intf_num) {
+    Ctx c;
+    Result rc = fresh(&c);
+    if (R_FAILED(rc)) { out("  append cmd %u %s: preparar -> 0x%X", cmd, attr_name, rc); done(&c); return; }
+    serviceAssumeDomain(&c.intf);
+    if (with_intf_num) {
+        const struct { u8 intf; u8 pad[3]; u32 speed; } in = { 0, {0}, UsbDeviceSpeed_High };
+        rc = serviceDispatchIn(&c.intf, cmd, in, .buffer_attrs = { attr }, .buffers = { { g_intf_desc, sizeof(g_intf_desc) } });
+    } else {
+        const u32 speed = UsbDeviceSpeed_High;
+        rc = serviceDispatchIn(&c.intf, cmd, speed, .buffer_attrs = { attr }, .buffers = { { g_intf_desc, sizeof(g_intf_desc) } });
     }
+    out("  append cmd %2u %-10s %s: 0x%X %s", cmd, attr_name, with_intf_num ? "(n,vel)" : "(vel)  ", rc, tag(rc));
+    done(&c);
+}
+
+static void test_register_endpoint(u32 cmd) {
+    Ctx c;
+    Result rc = fresh(&c);
+    if (R_FAILED(rc)) { out("  ep cmd %u: preparar -> 0x%X", cmd, rc); done(&c); return; }
+    Service ep = {0};
+    const u8 addr = USB_ENDPOINT_IN + 1;
+    serviceAssumeDomain(&c.intf);
+    rc = serviceDispatchIn(&c.intf, cmd, addr, .out_num_objects = 1, .out_objects = &ep);
+    out("  RegisterEndpoint cmd %2u (0x81): 0x%X %s", cmd, rc, tag(rc));
+    if (R_SUCCEEDED(rc)) {
+        Handle h = INVALID_HANDLE;
+        serviceAssumeDomain(&ep);
+        Result r2 = serviceDispatch(&ep, 2, .out_handle_attrs = { SfOutHandleAttr_HipcCopy }, .out_handles = &h);
+        out("    endpoint GetCompletionEvent (cmd 2): 0x%X %s", r2, tag(r2));
+        if (R_SUCCEEDED(r2) && h != INVALID_HANDLE) svcCloseHandle(h);
+        serviceAssumeDomain(&ep);
+        serviceClose(&ep);
+    }
+    done(&c);
 }
 
 int main(int argc, char **argv) {
@@ -49,70 +121,25 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
 
     g_log = fopen("sdmc:/switch/usbprobe.log", "w");
-    out("usbprobe 4 - comandos de IDsInterface/IDsEndpoint");
+    out("usbprobe 5 - IDsInterface con sesion nueva por prueba");
 
-    Service root = {0}, ds = {0}, intf = {0}, ep = {0};
-    Result rc = smGetService(&root, "usb:ds");
-    out("usb:ds -> 0x%X", rc);
-    if (R_FAILED(rc)) goto end;
-    rc = serviceConvertToDomain(&root);
-    serviceAssumeDomain(&root);
-    if (R_SUCCEEDED(rc)) rc = serviceDispatch(&root, 0, .out_num_objects = 1, .out_objects = &ds);
-    out("OpenDsService -> 0x%X", rc);
-    if (R_FAILED(rc)) goto end;
-    {
-        const u32 cid = 2;
-        serviceAssumeDomain(&ds);
-        rc = serviceDispatchIn(&ds, 0, cid, .in_num_handles = 1, .in_handles = { CUR_PROCESS_HANDLE });
-        out("Bind -> 0x%X", rc);
-    }
-    {
-        const u8 n = 0;
-        serviceAssumeDomain(&ds);
-        rc = serviceDispatchIn(&ds, 1, n, .out_num_objects = 1, .out_objects = &intf);
-        out("RegisterInterface(0) -> 0x%X", rc);
-        if (R_FAILED(rc)) goto end;
+    out("== Eventos (sin entrada, devuelve handle) ==");
+    for (u32 cmd = 1; cmd <= 14; cmd++) {
+        if (cmd == 3 || cmd == 4 || cmd == 10 || cmd == 12) continue; // necesitan buffers
+        test_event(cmd);
     }
 
-    // Antes de tocar nada, añadir configuración para que los comandos tengan sentido.
-    {
-        struct usb_interface_descriptor id = {0};
-        id.bLength = USB_DT_INTERFACE_SIZE;
-        id.bDescriptorType = USB_DT_INTERFACE;
-        id.bNumEndpoints = 2;
-        id.bInterfaceClass = 0xFF;
-        const u32 speed = UsbDeviceSpeed_High;
-        serviceAssumeDomain(&intf);
-        rc = serviceDispatchIn(&intf, 10, speed,
-            .buffer_attrs = { SfBufferAttr_HipcMapAlias | SfBufferAttr_In },
-            .buffers = { { &id, USB_DT_INTERFACE_SIZE } });
-        out("Interface Append (cmd 10) -> 0x%X", rc);
-    }
+    out("== AppendConfigurationData ==");
+    test_append(10, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
+    test_append(10, SfBufferAttr_HipcPointer | SfBufferAttr_In, "Pointer", false);
+    test_append(10, SfBufferAttr_HipcAutoSelect | SfBufferAttr_In, "AutoSelect", false);
+    test_append(12, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", true);
+    test_append(11, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
+    test_append(13, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
 
-    out("== IDsInterface: que comando da cada evento ==");
-    {
-        // 0 = RegisterEndpoint (necesita argumento), 3/4 = PostBuffer (necesitan buffer)
-        const u32 skip[] = {0, 3, 4, 10};
-        scan_handles("intf", &intf, 1, 14, skip, 4);
-    }
+    out("== RegisterEndpoint ==");
+    test_register_endpoint(0);
 
-    out("== IDsEndpoint ==");
-    {
-        const u8 addr = USB_ENDPOINT_IN + 1;
-        serviceAssumeDomain(&intf);
-        rc = serviceDispatchIn(&intf, 0, addr, .out_num_objects = 1, .out_objects = &ep);
-        out("RegisterEndpoint(0x81) -> 0x%X", rc);
-        if (R_SUCCEEDED(rc)) {
-            const u32 skip[] = {0, 4, 5}; // 0 PostBuffer, 4 Stall, 5 SetZlt
-            scan_handles("ep", &ep, 1, 8, skip, 3);
-        }
-    }
-
-end:
-    if (ep.session) { serviceAssumeDomain(&ep); serviceClose(&ep); }
-    if (intf.session) { serviceAssumeDomain(&intf); serviceClose(&intf); }
-    if (ds.session) { serviceAssumeDomain(&ds); serviceClose(&ds); }
-    if (root.session) serviceClose(&root);
     out("");
     out("Listo. Log: sdmc:/switch/usbprobe.log");
     out("Pulsa + para salir.");
