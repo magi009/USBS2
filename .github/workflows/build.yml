@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,3 +19,11 @@ jobs:
         with:
           name: USBS2
           path: USBS2.nro
+      - name: Publicar en Releases (ultima version)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: USBS2 (ultima compilacion)
+          prerelease: true
+          files: USBS2.nro
