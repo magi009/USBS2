@@ -53,6 +53,24 @@ static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, 
     return 0;
 }
 
+// ---- Diagnóstico: peticiones por el canal de control (endpoint 0) ----
+static Thread g_setup_thread;
+static bool g_setup_thread_ok = false;
+static std::atomic<u32> g_setup_count{0};
+
+u32 setup_count() { return g_setup_count.load(); }
+
+static void setup_watch(void *) {
+    while (!g_quit->load()) {
+        if (!g_intf) { svcSleepThread(100'000'000ULL); continue; }
+        Result rc = eventWait(&g_intf->SetupEvent, 100'000'000ULL);
+        if (R_FAILED(rc)) continue;
+        eventClear(&g_intf->SetupEvent);
+        u32 n = ++g_setup_count;
+        log_write("    usb: PETICION DE CONTROL #%u recibida (canal de control)", n);
+    }
+}
+
 Result init(std::atomic<bool> *quit_flag) {
     g_quit = quit_flag;
     Result rc;
@@ -118,10 +136,20 @@ Result init(std::atomic<bool> *quit_flag) {
     };
     TRY(usbDsSetBinaryObjectStore(bos, sizeof(bos)));
     TRY(usbDsEnable());
+    if (R_SUCCEEDED(threadCreate(&g_setup_thread, setup_watch, nullptr, nullptr, 0x4000, 0x2C, -2)) &&
+        R_SUCCEEDED(threadStart(&g_setup_thread)))
+        g_setup_thread_ok = true;
     return 0;
 }
 
-void exit() { usbDsExit(); }
+void exit() {
+    if (g_setup_thread_ok) {
+        threadWaitForExit(&g_setup_thread);
+        threadClose(&g_setup_thread);
+        g_setup_thread_ok = false;
+    }
+    usbDsExit();
+}
 
 static void update_max_packet();
 
