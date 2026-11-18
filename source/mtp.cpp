@@ -81,7 +81,7 @@ static u32 g_pending_len = 0;
 // Canal PC -> consola: SIEMPRE hay varias lecturas publicadas (cola de 3). Mientras
 // se procesa un bloque, las otras siguen recibiendo: nunca hay un instante en que
 // el PC mande datos sin nadie escuchando (en Switch 2 eso hace que Windows cancele).
-static constexpr u32 RX_SIZE = 64 * 1024; // Switch 2: probar lecturas USB pequenas
+static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
 static constexpr int RX_N = 3;
 static u8 *g_rx[RX_N];
 static bool g_rx_running = false;
@@ -231,19 +231,34 @@ static void touch_save(const Obj &o) {
     if (o.storage == STOR_SV) saves::commit(o.save);
 }
 
+// Borra un archivo o una carpeta con todo su contenido. Primero se leen todos los
+// nombres y después se borra: borrar mientras se lee la carpeta salta entradas en la
+// micro y la carpeta quedaba sin vaciar ("No tiene permiso para eliminar").
 static bool rm_rf(const std::string &p) {
     struct stat st;
-    if (stat(p.c_str(), &st) != 0) return false;
-    if (!S_ISDIR(st.st_mode)) return unlink(p.c_str()) == 0;
-    DIR *d = opendir(p.c_str());
-    if (d) {
-        while (auto *e = readdir(d)) {
-            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            rm_rf(p + "/" + e->d_name);
-        }
-        closedir(d);
+    if (stat(p.c_str(), &st) != 0) { log_write("mtp: borrar: no existe %s (errno %d)", p.c_str(), errno); return false; }
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(p.c_str()) == 0) return true;
+        log_write("mtp: borrar: unlink %s -> errno %d", p.c_str(), errno);
+        return false;
     }
-    return rmdir(p.c_str()) == 0;
+    bool ok = true;
+    for (int pass = 0; pass < 3; pass++) {
+        std::vector<std::string> names;
+        if (DIR *d = opendir(p.c_str())) {
+            while (auto *e = readdir(d)) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                names.emplace_back(e->d_name);
+            }
+            closedir(d);
+        }
+        if (names.empty()) break;
+        ok = true;
+        for (auto &n : names) ok &= rm_rf(p + "/" + n);
+    }
+    if (rmdir(p.c_str()) == 0) return true;
+    log_write("mtp: borrar: rmdir %s -> errno %d", p.c_str(), errno);
+    return false;
 }
 
 // Tras renombrar/mover un objeto, actualiza las rutas de sus hijos ya conocidos.
