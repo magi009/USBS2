@@ -81,7 +81,7 @@ static u32 g_pending_len = 0;
 // Canal PC -> consola: SIEMPRE hay varias lecturas publicadas (cola de 3). Mientras
 // se procesa un bloque, las otras siguen recibiendo: nunca hay un instante en que
 // el PC mande datos sin nadie escuchando (en Switch 2 eso hace que Windows cancele).
-static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
+static constexpr u32 RX_SIZE = 64 * 1024; // Switch 2: probar lecturas USB pequenas
 static constexpr int RX_N = 3;
 static u8 *g_rx[RX_N];
 static bool g_rx_running = false;

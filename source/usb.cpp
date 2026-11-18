@@ -19,10 +19,7 @@ static Result log_rc(const char *what, Result rc) {
 
 static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, u8 addr_irq) {
     Result rc;
-    // Switch 2: con 64 en la tabla Full Speed, el PC no puede mandar paquetes de 512
-    // aunque el enlace es High Speed (todo lo que pasa de 1 paquete falla al instante).
-    // Se usa 512 también ahí para que el controlador acepte paquetes completos.
-    u16 bulk_mps = speed == UsbDeviceSpeed_Super ? 0x400 : 0x200;
+    u16 bulk_mps = speed == UsbDeviceSpeed_Full ? 0x40 : (speed == UsbDeviceSpeed_High ? 0x200 : 0x400);
 
     usb_endpoint_descriptor ep{};
     ep.bLength = USB_DT_ENDPOINT_SIZE;
