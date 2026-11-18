@@ -14,11 +14,18 @@ jobs:
     container: devkitpro/devkita64:20260219
     steps:
       - uses: actions/checkout@v4
-      - name: Instalar ounce-devkit (libounce, ouncevk, libkaihen)
+      - name: Compilar libounce (con parches de patches/)
+        env:
+          LIBOUNCE_REF: 7270a6acee972acf628c482e577b53c7e6f02e76
         run: |
-          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
-          curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/ouncebrew/ounce-devkit/main/install.sh
-          sh /tmp/install.sh
+          apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          git clone https://github.com/ouncebrew/libounce /tmp/libounce
+          cd /tmp/libounce && git checkout "$LIBOUNCE_REF"
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "Aplicando $p"; git apply "$p"
+          done
+          make -j$(nproc) && make install
       - name: Compilar
         run: |
           make -j$(nproc)
