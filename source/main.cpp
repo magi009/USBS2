@@ -10,7 +10,7 @@
 #include "mtp.h"
 #include "saves.h"
 
-// Escribe el paso en pantalla y en sdmc:/USBS2.log antes de ejecutarlo,
+// Escribe el paso en pantalla y en sdmc:/switch/USBS2.log antes de ejecutarlo,
 // así si la consola se cae sabemos exactamente dónde.
 static void step(const char *s) {
     log_write("%s", s);
@@ -19,7 +19,7 @@ static void step(const char *s) {
 }
 
 int main(int, char **) {
-    remove("sdmc:/USBS2.log");
+    remove("sdmc:/USBS2.log");          // log viejo en la raíz (versiones anteriores)
     remove("sdmc:/switch/USBS2.log");
     consoleInit(nullptr);
     step("[1] consola iniciada");
@@ -95,7 +95,7 @@ int main(int, char **) {
             printf("  - Partidas guardadas   -> una carpeta por juego/usuario\x1b[K\n\n");
             printf("Cierra los juegos antes de tocar sus partidas.\x1b[K\n");
         }
-        printf("\nRegistro: sdmc:/USBS2.log\x1b[K\n");
+        printf("\nRegistro: sdmc:/switch/USBS2.log\x1b[K\n");
         printf("Pulsa + o B para salir.\x1b[K\n");
         consoleUpdate(nullptr);
         svcSleepThread(50'000'000ULL);

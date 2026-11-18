@@ -1,6 +1,6 @@
 #pragma once
 // Registro de diagnóstico: se guarda en memoria (para mostrarlo en pantalla)
-// y se intenta escribir en sdmc:/USBS2.log y sdmc:/switch/USBS2.log.
+// y en sdmc:/switch/USBS2.log.
 #include <switch.h>
 #include <cstdio>
 #include <cstdarg>
@@ -26,11 +26,9 @@ inline void log_write(const char *fmt, ...) {
     auto &v = log_lines();
     v.push_back(line);
     if (v.size() > 200) v.erase(v.begin());
-    for (const char *path : {"sdmc:/USBS2.log", "sdmc:/switch/USBS2.log"}) {
-        if (FILE *f = fopen(path, "a")) {
-            fprintf(f, "%s\n", line);
-            fclose(f);
-        }
+    if (FILE *f = fopen("sdmc:/switch/USBS2.log", "a")) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
     }
     mutexUnlock(&log_mutex());
 }

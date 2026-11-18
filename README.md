@@ -24,7 +24,7 @@ Botones al abrir la app (mantenlos mientras la abres):
 - **R** – modo seguro: sin partidas guardadas.
 - **ZL** – registro detallado: anota cada operación en `USBS2.log` (más lento; solo para diagnosticar).
 
-El registro está en `sdmc:/USBS2.log` o `sdmc:/switch/USBS2.log`. Si el USB no arranca, el error también sale en pantalla.
+El registro está en `sdmc:/switch/USBS2.log`. Si el USB no arranca, el error también sale en pantalla.
 
 ## Avisos
 - **Cierra el juego** antes de tocar sus partidas. Con el juego abierto, la carpeta aparecerá vacía o dará error.
