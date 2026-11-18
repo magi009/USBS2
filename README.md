@@ -10,13 +10,13 @@ Al abrir `USBS2.nro` arranca el modo MTP de inmediato, sin menús. Conecta el ca
 
 Puedes copiar, pegar, borrar, renombrar, mover y crear carpetas. En las partidas, cada cambio se guarda (commit) en la partida apenas termina.
 
-## Compilar sin instalar nada (GitHub)
+## Compilar sin instalar nada (GitHub, con ounce-devkit para Switch 2)
 1. Crea un repositorio nuevo en GitHub y sube esta carpeta tal cual (incluida `.github/`).
 2. Ve a **Actions → Compilar USBS2.nro** y espera 1–2 minutos.
 3. Descarga el artefacto **USBS2** y saca de ahí `USBS2.nro`.
 
 ## Compilar en tu PC
-Con devkitPro (paquete `switch-dev`) instalado: `make`
+Con devkitPro + ounce-devkit (https://github.com/ouncebrew/ounce-devkit) instalado: `make`
 
 ## Instalar
 Copia `USBS2.nro` a `sdmc:/switch/` y ábrela desde el Homebrew Launcher.

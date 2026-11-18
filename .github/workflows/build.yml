@@ -1,4 +1,4 @@
-name: Compilar USBS2.nro
+name: Compilar USBS2.nro (Switch 2 / ounce-devkit)
 
 on:
   push:
@@ -10,9 +10,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    # Misma base que el Dockerfile oficial de ouncebrew/ounce-devkit
+    container: devkitpro/devkita64:20260219
     steps:
       - uses: actions/checkout@v4
+      - name: Instalar ounce-devkit (libounce, ouncevk, libkaihen)
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+          curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/ouncebrew/ounce-devkit/main/install.sh
+          sh /tmp/install.sh
       - name: Compilar
         run: make -j$(nproc)
       - uses: actions/upload-artifact@v4
@@ -24,6 +30,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: USBS2 (ultima compilacion)
+          name: USBS2 (ultima compilacion, Switch 2)
           prerelease: true
           files: USBS2.nro
