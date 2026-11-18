@@ -78,7 +78,7 @@ void exit() {
 void unmount_all() {
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (g_slot_owner[i] < 0) continue;
-        char dev[8];
+        char dev[16];
         snprintf(dev, sizeof(dev), "sv%d", i);
         fsdevCommitDevice(dev);
         fsdevUnmountDevice(dev);
@@ -143,7 +143,7 @@ bool mount(int idx, std::string &dev_out) {
         slot = 0;
         for (int i = 1; i < MAX_MOUNTS; i++)
             if (g_slot_use[i] < g_slot_use[slot]) slot = i;
-        char dev[8];
+        char dev[16];
         snprintf(dev, sizeof(dev), "sv%d", slot);
         fsdevCommitDevice(dev);
         fsdevUnmountDevice(dev);
@@ -153,7 +153,7 @@ bool mount(int idx, std::string &dev_out) {
 
     FsFileSystem fs;
     if (R_FAILED(fsOpenSaveDataFileSystem(&fs, e.space, &e.attr))) return false;
-    char dev[8];
+    char dev[16];
     snprintf(dev, sizeof(dev), "sv%d", slot);
     if (fsdevMountDevice(dev, fs) < 0) {
         fsFsClose(&fs);
@@ -168,7 +168,7 @@ bool mount(int idx, std::string &dev_out) {
 
 void commit(int idx) {
     if (idx < 0 || idx >= (int)g_entries.size() || g_entries[idx].slot < 0) return;
-    char dev[8];
+    char dev[16];
     snprintf(dev, sizeof(dev), "sv%d", g_entries[idx].slot);
     fsdevCommitDevice(dev);
 }

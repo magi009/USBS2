@@ -140,8 +140,8 @@ static bool xfer(UsbDsEndpoint *ep, void *buf, u32 size, u32 *out) {
             eventClear(&ep->CompletionEvent);
             return false;
         }
-        u32 st = 0;
-        if (R_SUCCEEDED(usbDsGetState(&st)) && st != 5) { // cable desconectado
+        UsbState st;
+        if (R_SUCCEEDED(usbDsGetState(&st)) && st != UsbState_Configured) { // cable desconectado
             usbDsEndpoint_Cancel(ep);
             eventWait(&ep->CompletionEvent, 1'000'000'000ULL);
             eventClear(&ep->CompletionEvent);
