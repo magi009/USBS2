@@ -3,6 +3,7 @@
 #include "mtp.h"
 #include "usb.h"
 #include "saves.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -717,6 +718,8 @@ static bool op_refs(const Cmd &c) {
 }
 
 static bool dispatch(const Cmd &c) {
+    if (c.code != OP_GetObjectPropValue && c.code != OP_GetObjectInfo)
+        log_write("mtp: op 0x%04X tid %u p0 0x%X", c.code, c.tid, c.np ? c.p[0] : 0);
     if (c.code == OP_GetDeviceInfo) return op_device_info(c);
     if (c.code == OP_OpenSession) {
         if (g_session) return send_response(c.tid, RC_SessionAlreadyOpen);
@@ -770,9 +773,12 @@ static void session_loop() {
 static void thread_main(void *) {
     while (!g_quit->load()) {
         set_status("Esperando cable USB...");
+        log_write("mtp: esperando cable");
         if (!usb::wait_ready()) break;
         set_status("Cable conectado, esperando al PC...");
+        log_write("mtp: cable conectado (paquete max %u)", usb::max_packet());
         session_loop();
+        log_write("mtp: sesion USB terminada");
         g_session = false;
         g_send.pending = false;
         saves::unmount_all();
@@ -789,7 +795,7 @@ Result start(std::atomic<bool> *quit) {
     if (!g_buf || !g_cmd) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     mkdir("sdmc:/switch", 0777);
     Result rc = usb::init(quit);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) { usb::exit(); return rc; }
     rc = threadCreate(&g_thread, thread_main, nullptr, nullptr, 0x20000, 0x2C, -2);
     if (R_SUCCEEDED(rc)) rc = threadStart(&g_thread);
     return rc;

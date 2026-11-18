@@ -1,5 +1,6 @@
 // usb.cpp - Capa USB (usb:ds) para exponer la consola como dispositivo MTP.
 #include "usb.h"
+#include "log.h"
 #include <cstring>
 
 namespace usb {
@@ -7,6 +8,8 @@ namespace usb {
 static UsbDsInterface *g_intf = nullptr;
 static UsbDsEndpoint *g_ep_in = nullptr, *g_ep_out = nullptr, *g_ep_irq = nullptr;
 static std::atomic<bool> *g_quit = nullptr;
+
+#define TRY(call) do { rc = (call); log_write("    usb: %s -> 0x%X", #call, rc); if (R_FAILED(rc)) return rc; } while (0)
 
 static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, u8 addr_irq) {
     Result rc;
@@ -47,16 +50,16 @@ static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, 
 
 Result init(std::atomic<bool> *quit_flag) {
     g_quit = quit_flag;
-    Result rc = usbDsInitialize();
-    if (R_FAILED(rc)) return rc;
+    Result rc;
+    TRY(usbDsInitialize());
 
     static const u16 langs[1] = {0x0409};
     u8 iManufacturer, iProduct, iSerial, iInterface;
-    if (R_FAILED(rc = usbDsAddUsbLanguageStringDescriptor(nullptr, langs, 1))) return rc;
-    if (R_FAILED(rc = usbDsAddUsbStringDescriptor(&iManufacturer, "Nintendo"))) return rc;
-    if (R_FAILED(rc = usbDsAddUsbStringDescriptor(&iProduct, "Switch 2 (USBS2)"))) return rc;
-    if (R_FAILED(rc = usbDsAddUsbStringDescriptor(&iSerial, "USBS2-0001"))) return rc;
-    if (R_FAILED(rc = usbDsAddUsbStringDescriptor(&iInterface, "MTP"))) return rc;
+    TRY(usbDsAddUsbLanguageStringDescriptor(nullptr, langs, 1));
+    TRY(usbDsAddUsbStringDescriptor(&iManufacturer, "Nintendo"));
+    TRY(usbDsAddUsbStringDescriptor(&iProduct, "Switch 2 (USBS2)"));
+    TRY(usbDsAddUsbStringDescriptor(&iSerial, "USBS2-0001"));
+    TRY(usbDsAddUsbStringDescriptor(&iInterface, "MTP"));
 
     usb_device_descriptor dev{};
     dev.bLength = USB_DT_DEVICE_SIZE;
@@ -70,21 +73,21 @@ Result init(std::atomic<bool> *quit_flag) {
     dev.iProduct = iProduct;
     dev.iSerialNumber = iSerial;
     dev.bNumConfigurations = 1;
-    if (R_FAILED(rc = usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Full, &dev))) return rc;
+    TRY(usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Full, &dev));
     dev.bcdUSB = 0x0200;
-    if (R_FAILED(rc = usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_High, &dev))) return rc;
+    TRY(usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_High, &dev));
     dev.bcdUSB = 0x0300;
     dev.bMaxPacketSize0 = 0x09;
-    if (R_FAILED(rc = usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Super, &dev))) return rc;
+    TRY(usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Super, &dev));
 
     static const u8 bos[0x16] = {
         0x05, 0x0F, 0x16, 0x00, 0x02,
         0x07, 0x10, 0x02, 0x02, 0x00, 0x00, 0x00,
         0x0A, 0x10, 0x03, 0x00, 0x0E, 0x00, 0x03, 0x00, 0x00, 0x00,
     };
-    if (R_FAILED(rc = usbDsSetBinaryObjectStore(bos, sizeof(bos)))) return rc;
+    TRY(usbDsSetBinaryObjectStore(bos, sizeof(bos)));
 
-    if (R_FAILED(rc = usbDsRegisterInterface(&g_intf))) return rc;
+    TRY(usbDsRegisterInterface(&g_intf));
 
     usb_interface_descriptor intf{};
     intf.bLength = USB_DT_INTERFACE_SIZE;
@@ -99,15 +102,16 @@ Result init(std::atomic<bool> *quit_flag) {
     const u8 addr_in = USB_ENDPOINT_IN + 1, addr_out = USB_ENDPOINT_OUT + 1, addr_irq = USB_ENDPOINT_IN + 2;
     const UsbDeviceSpeed speeds[3] = {UsbDeviceSpeed_Full, UsbDeviceSpeed_High, UsbDeviceSpeed_Super};
     for (auto sp : speeds) {
-        if (R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, sp, &intf, USB_DT_INTERFACE_SIZE))) return rc;
-        if (R_FAILED(rc = add_endpoint_descs(sp, addr_in, addr_out, addr_irq))) return rc;
+        TRY(usbDsInterface_AppendConfigurationData(g_intf, sp, &intf, USB_DT_INTERFACE_SIZE));
+        TRY(add_endpoint_descs(sp, addr_in, addr_out, addr_irq));
     }
 
-    if (R_FAILED(rc = usbDsInterface_RegisterEndpoint(g_intf, &g_ep_in, addr_in))) return rc;
-    if (R_FAILED(rc = usbDsInterface_RegisterEndpoint(g_intf, &g_ep_out, addr_out))) return rc;
-    if (R_FAILED(rc = usbDsInterface_RegisterEndpoint(g_intf, &g_ep_irq, addr_irq))) return rc;
-    if (R_FAILED(rc = usbDsInterface_EnableInterface(g_intf))) return rc;
-    return usbDsEnable();
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_in, addr_in));
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_out, addr_out));
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_irq, addr_irq));
+    TRY(usbDsInterface_EnableInterface(g_intf));
+    TRY(usbDsEnable());
+    return 0;
 }
 
 void exit() { usbDsExit(); }

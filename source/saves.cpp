@@ -1,5 +1,6 @@
 // saves.cpp - Lista y monta partidas guardadas bajo demanda (sv0:/ ... sv7:/).
 #include "saves.h"
+#include "log.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -20,7 +21,7 @@ static std::vector<Entry> g_entries;
 static int g_slot_owner[MAX_MOUNTS];
 static u64 g_slot_use[MAX_MOUNTS];
 static u64 g_tick = 0;
-static bool g_ns = false, g_acc = false;
+static bool g_ns = false, g_acc = false, g_enabled = false;
 
 static std::string sanitize(std::string s) {
     for (auto &c : s)
@@ -64,8 +65,13 @@ static std::string user_name(AccountUid uid) {
 }
 
 void init() {
-    g_ns = R_SUCCEEDED(nsInitialize());
-    g_acc = R_SUCCEEDED(accountInitialize(AccountServiceType_Application));
+    Result rc = nsInitialize();
+    log_write("    nsInitialize -> 0x%X", rc);
+    g_ns = R_SUCCEEDED(rc);
+    rc = accountInitialize(AccountServiceType_Application);
+    log_write("    accountInitialize -> 0x%X", rc);
+    g_acc = R_SUCCEEDED(rc);
+    g_enabled = true;
     for (int i = 0; i < MAX_MOUNTS; i++) g_slot_owner[i] = -1;
 }
 
@@ -90,10 +96,13 @@ void unmount_all() {
 void scan() {
     unmount_all();
     g_entries.clear();
+    if (!g_enabled) return;
     std::set<std::string> used;
 
     FsSaveDataInfoReader reader;
-    if (R_FAILED(fsOpenSaveDataInfoReader(&reader, FsSaveDataSpaceId_User))) return;
+    Result rc = fsOpenSaveDataInfoReader(&reader, FsSaveDataSpaceId_User);
+    log_write("    fsOpenSaveDataInfoReader -> 0x%X", rc);
+    if (R_FAILED(rc)) return;
     FsSaveDataInfo info;
     s64 got = 0;
     while (R_SUCCEEDED(fsSaveDataInfoReaderRead(&reader, &info, 1, &got)) && got == 1) {
@@ -120,6 +129,7 @@ void scan() {
         g_entries.push_back(e);
     }
     fsSaveDataInfoReaderClose(&reader);
+    log_write("    partidas encontradas: %d", (int)g_entries.size());
 }
 
 int count() { return (int)g_entries.size(); }
@@ -152,7 +162,8 @@ bool mount(int idx, std::string &dev_out) {
     }
 
     FsFileSystem fs;
-    if (R_FAILED(fsOpenSaveDataFileSystem(&fs, e.space, &e.attr))) return false;
+    Result rc = fsOpenSaveDataFileSystem(&fs, e.space, &e.attr);
+    if (R_FAILED(rc)) { log_write("    montar '%s' -> 0x%X", e.name.c_str(), rc); return false; }
     char dev[16];
     snprintf(dev, sizeof(dev), "sv%d", slot);
     if (fsdevMountDevice(dev, fs) < 0) {

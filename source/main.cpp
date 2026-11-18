@@ -1,22 +1,53 @@
 // USBS2 - Transferencia local por USB (MTP) para Switch 2 / Switch.
 // Al abrirla, el PC ve la consola como dispositivo con 3 unidades:
 //   Tarjeta SD (sdmc:/), Homebrew (sdmc:/switch) y Partidas guardadas.
+// Mantén R al abrir para el MODO SEGURO (sin partidas guardadas).
 #include <switch.h>
 #include <atomic>
 #include <cstdio>
+#include "log.h"
 #include "mtp.h"
 #include "saves.h"
 
+// Escribe el paso en pantalla y en sdmc:/USBS2.log antes de ejecutarlo,
+// así si la consola se cae sabemos exactamente dónde.
+static void step(const char *s) {
+    log_write("%s", s);
+    printf("%s\n", s);
+    consoleUpdate(nullptr);
+}
+
 int main(int, char **) {
+    remove("sdmc:/USBS2.log");
     consoleInit(nullptr);
+    step("[1] consola iniciada");
+
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
-    appletSetMediaPlaybackState(true); // evita que la pantalla se apague en copias largas
+    padUpdate(&pad);
+    bool safe = padGetButtons(&pad) & HidNpadButton_R;
+    log_write("    modo seguro: %s", safe ? "si" : "no");
+    log_write("    firmware: %u.%u.%u", HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()));
+    log_write("    applet type: %d", (int)appletGetAppletType());
+
+    step("[2] applet: evitar suspension");
+    appletSetMediaPlaybackState(true);
 
     static std::atomic<bool> quit{false};
-    saves::init();
+    if (!safe) {
+        step("[3] servicios de partidas (ns, acc)");
+        saves::init();
+    } else {
+        step("[3] MODO SEGURO: partidas desactivadas");
+    }
+
+    step("[4] iniciando USB (usb:ds)...");
     Result rc = mtp::start(&quit);
+    log_write("    resultado USB: 0x%X", rc);
+    step("[5] listo");
+    svcSleepThread(1'000'000'000ULL);
+    consoleClear();
 
     char line[128];
     u64 bytes = 0;
@@ -26,7 +57,7 @@ int main(int, char **) {
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
 
         printf("\x1b[1;1H");
-        printf("USBS2 - Transferencia USB (MTP)\x1b[K\n");
+        printf("USBS2 - Transferencia USB (MTP)%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -41,11 +72,13 @@ int main(int, char **) {
             printf("  - Partidas guardadas   -> una carpeta por juego/usuario\x1b[K\n\n");
             printf("Cierra los juegos antes de tocar sus partidas.\x1b[K\n");
         }
-        printf("\nPulsa + o B para salir.\x1b[K\n");
+        printf("\nRegistro: sdmc:/USBS2.log\x1b[K\n");
+        printf("Pulsa + o B para salir.\x1b[K\n");
         consoleUpdate(nullptr);
         svcSleepThread(50'000'000ULL);
     }
 
+    log_write("salida normal");
     quit = true;
     if (R_SUCCEEDED(rc)) mtp::stop();
     saves::exit();
