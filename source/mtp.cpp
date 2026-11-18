@@ -36,7 +36,7 @@ enum : u16 {
     OP_GetDevicePropValue = 0x1015, OP_MoveObject = 0x1019, OP_GetPartialObject = 0x101B,
     OP_GetObjectPropsSupported = 0x9801, OP_GetObjectPropDesc = 0x9802,
     OP_GetObjectPropValue = 0x9803, OP_SetObjectPropValue = 0x9804,
-    OP_GetObjectPropList = 0x9805, OP_GetObjectReferences = 0x9810,
+    OP_GetObjectPropList = 0x9805, OP_SendObjectPropList = 0x9808, OP_GetObjectReferences = 0x9810,
 
     RC_OK = 0x2001, RC_GeneralError = 0x2002, RC_SessionNotOpen = 0x2003,
     RC_OperationNotSupported = 0x2005, RC_InvalidStorageID = 0x2008,
@@ -437,13 +437,14 @@ static bool op_device_info(const Cmd &c) {
     w.u16_(100);
     w.str("microsoft.com: 1.0;");
     w.u16_(0);
+    // Mismo conjunto que anuncia libhaze (Sphaira), que funciona con el Explorador de
+    // Windows. Windows cambia su forma de copiar según lo que se anuncia aquí.
     w.a16({OP_GetDeviceInfo, OP_OpenSession, OP_CloseSession, OP_GetStorageIDs, OP_GetStorageInfo,
-           OP_GetObjectHandles, OP_GetObjectInfo, OP_GetObject, OP_DeleteObject, OP_SendObjectInfo,
-           OP_SendObject, OP_GetDevicePropDesc, OP_GetDevicePropValue, OP_MoveObject, OP_GetPartialObject,
-           OP_GetObjectPropsSupported, OP_GetObjectPropDesc, OP_GetObjectPropValue, OP_SetObjectPropValue,
-           OP_GetObjectReferences, OP_GetObjectPropList});
+           OP_GetObjectHandles, OP_GetObjectInfo, OP_GetObject, OP_SendObjectInfo, OP_SendObject,
+           OP_DeleteObject, OP_GetObjectPropsSupported, OP_GetObjectPropDesc, OP_GetObjectPropValue,
+           OP_SetObjectPropValue, OP_GetObjectPropList, OP_SendObjectPropList});
     w.a16({});
-    w.a16({DPROP_FriendlyName});
+    w.a16({});
     w.a16({});
     w.a16({FMT_Undefined, FMT_Association});
     w.str("Nintendo");
@@ -628,18 +629,9 @@ static bool op_delete(const Cmd &c) {
 // estado entre SendObjectInfo y SendObject
 static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; } g_send;
 
-static bool op_send_object_info(const Cmd &c) {
-    u32 st = c.p[0], parent_h = c.np > 1 ? c.p[1] : ROOT;
-    std::vector<u8> data;
-    if (!recv_data([&](const u8 *p, size_t n) { data.insert(data.end(), p, p + n); return data.size() < 0x10000; }))
-        return false;
+// Crea el archivo/carpeta pedido por SendObjectInfo o SendObjectPropList y responde.
+static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name, u16 fmt, u64 size) {
     g_send.pending = false;
-    if (data.size() < 53) return send_response(c.tid, RC_NoValidObjectInfo);
-
-    u16 fmt = rd16(&data[4]);
-    std::string name = rd_str(&data[52], data.size() - 52, nullptr);
-    log_debug("mtp: SendObjectInfo '%s' formato 0x%04X tamano %u (almacen 0x%X, padre 0x%X, %u bytes de info)",
-              name.c_str(), fmt, rd32(&data[8]), st, parent_h, (unsigned)data.size());
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
 
     Obj parent{st, -1, "", 0, true};
@@ -668,10 +660,72 @@ static bool op_send_object_info(const Cmd &c) {
         g_send.pending = true;
         g_send.handle = h;
         g_send.path = path;
-        u32 sz = rd32(&data[8]);
-        g_send.size = sz == 0xFFFFFFFF ? 0 : sz; // >4 GB: tamaño desconocido aquí
+        g_send.size = size;
     }
-    return send_response(c.tid, RC_OK, {st, parent_h == 0 ? ROOT : parent_h, h});
+    // Como libhaze: carpeta padre 0 cuando el objeto queda en la raíz de la unidad.
+    return send_response(c.tid, RC_OK, {st, parent_h, h});
+}
+
+static bool op_send_object_info(const Cmd &c) {
+    u32 st = c.p[0], parent_h = c.np > 1 ? c.p[1] : ROOT;
+    std::vector<u8> data;
+    if (!recv_data([&](const u8 *p, size_t n) { data.insert(data.end(), p, p + n); return data.size() < 0x10000; }))
+        return false;
+    if (g_aborted) return true;
+    g_send.pending = false;
+    if (data.size() < 53) return send_response(c.tid, RC_NoValidObjectInfo);
+    u16 fmt = rd16(&data[4]);
+    u32 sz = rd32(&data[8]);
+    std::string name = rd_str(&data[52], data.size() - 52, nullptr);
+    log_debug("mtp: SendObjectInfo '%s' formato 0x%04X tamano %u (almacen 0x%X, padre 0x%X)", name.c_str(), fmt, sz, st, parent_h);
+    return create_object(c, st, parent_h, name, fmt, sz == 0xFFFFFFFF ? 0 : sz);
+}
+
+// Tamaño en bytes de un valor de tipo MTP (cadenas aparte).
+static size_t dt_size(u16 t) {
+    switch (t) {
+    case 0x0001: case 0x0002: return 1;
+    case 0x0003: case 0x0004: return 2;
+    case 0x0005: case 0x0006: return 4;
+    case 0x0007: case 0x0008: return 8;
+    case 0x0009: case 0x000A: return 16;
+    }
+    return 0;
+}
+
+// SendObjectPropList: como SendObjectInfo, pero el tamaño (64 bits) va en los
+// parámetros y el nombre en una lista de propiedades.
+static bool op_send_object_prop_list(const Cmd &c) {
+    u32 st = c.p[0], parent_h = c.np > 1 ? c.p[1] : ROOT;
+    u16 fmt = (u16)(c.np > 2 ? c.p[2] : FMT_Undefined);
+    u64 size = ((u64)(c.np > 3 ? c.p[3] : 0) << 32) | (c.np > 4 ? c.p[4] : 0);
+    std::vector<u8> data;
+    if (!recv_data([&](const u8 *p, size_t n) { data.insert(data.end(), p, p + n); return data.size() < 0x10000; }))
+        return false;
+    if (g_aborted) return true;
+    std::string name;
+    if (data.size() >= 4) {
+        u32 count = rd32(&data[0]);
+        size_t off = 4;
+        for (u32 i = 0; i < count && off + 8 <= data.size(); i++) {
+            u16 prop = rd16(&data[off + 4]);
+            u16 type = rd16(&data[off + 6]);
+            off += 8;
+            if (type == DT_STR) {
+                size_t used = 0;
+                std::string v = rd_str(&data[off], data.size() - off, &used);
+                if (prop == PROP_ObjectFileName) name = v;
+                off += used ? used : 1;
+            } else {
+                size_t n = dt_size(type);
+                if (!n) break;
+                off += n;
+            }
+        }
+    }
+    log_debug("mtp: SendObjectPropList '%s' formato 0x%04X tamano %llu (almacen 0x%X, padre 0x%X)", name.c_str(), fmt,
+              (unsigned long long)size, st, parent_h);
+    return create_object(c, st, parent_h, name, fmt, size);
 }
 
 static bool op_send_object(const Cmd &c) {
@@ -765,17 +819,16 @@ static void prop_desc(W &w, u16 prop) {
 
 static bool known_prop(u16 p) {
     switch (p) {
-    case PROP_StorageID: case PROP_ObjectFormat: case PROP_ProtectionStatus: case PROP_ObjectSize:
-    case PROP_ObjectFileName: case PROP_DateModified: case PROP_ParentObject: case PROP_PersistentUID:
-    case PROP_Name: return true;
+    case PROP_StorageID: case PROP_ObjectFormat: case PROP_ObjectSize:
+    case PROP_ObjectFileName: case PROP_ParentObject: case PROP_PersistentUID: return true;
     }
     return false;
 }
 
 static bool op_props_supported(const Cmd &c) {
     W w;
-    w.a16({PROP_StorageID, PROP_ObjectFormat, PROP_ProtectionStatus, PROP_ObjectSize, PROP_ObjectFileName,
-           PROP_DateModified, PROP_ParentObject, PROP_PersistentUID, PROP_Name});
+    w.a16({PROP_StorageID, PROP_ObjectFormat, PROP_ObjectSize, PROP_ObjectFileName, PROP_ParentObject,
+           PROP_PersistentUID});
     return send_data(c, w.v) && send_response(c.tid, RC_OK);
 }
 
@@ -809,8 +862,8 @@ static void put_prop_value(W &w, u32 h, const Obj &o, u16 prop, bool dir, u64 si
     }
 }
 
-static const u16 ALL_PROPS[] = {PROP_StorageID, PROP_ObjectFormat, PROP_ProtectionStatus, PROP_ObjectSize,
-                                PROP_ObjectFileName, PROP_DateModified, PROP_ParentObject, PROP_PersistentUID, PROP_Name};
+static const u16 ALL_PROPS[] = {PROP_StorageID, PROP_ObjectFormat, PROP_ObjectSize, PROP_ObjectFileName,
+                                PROP_ParentObject, PROP_PersistentUID};
 
 static bool op_prop_value(const Cmd &c) {
     u32 h = c.p[0];
@@ -955,6 +1008,7 @@ static bool dispatch(const Cmd &c) {
     case OP_GetDevicePropDesc: case OP_GetDevicePropValue: return op_dev_prop(c);
     case OP_GetObjectReferences: return op_refs(c);
     case OP_GetObjectPropList: return op_prop_list(c);
+    case OP_SendObjectPropList: return op_send_object_prop_list(c);
     default: return send_response(c.tid, RC_OperationNotSupported);
     }
 }
