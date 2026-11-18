@@ -242,7 +242,21 @@ static bool rm_rf(const std::string &p) {
         log_write("mtp: borrar: unlink %s -> errno %d", p.c_str(), errno);
         return false;
     }
-    bool ok = true;
+    // Carpeta: lo hace el propio sistema de archivos de la consola, de una vez.
+    size_t colon = p.find(":/");
+    if (colon != std::string::npos) {
+        std::string dev = p.substr(0, colon), rest = p.substr(colon + 1);
+        if (FsFileSystem *fs = fsdevGetDeviceFileSystem(dev.c_str())) {
+            char fp[FS_MAX_PATH] = {0};
+            snprintf(fp, sizeof(fp), "%s", rest.c_str());
+            Result rc = fsFsDeleteDirectoryRecursively(fs, fp);
+            if (R_SUCCEEDED(rc)) return true;
+            log_write("mtp: borrar: DeleteDirectoryRecursively %s -> 0x%X", p.c_str(), rc);
+        } else {
+            log_write("mtp: borrar: sin sistema de archivos para '%s'", dev.c_str());
+        }
+    }
+    // Plan B: a mano (primero leer todos los nombres, después borrar).
     for (int pass = 0; pass < 3; pass++) {
         std::vector<std::string> names;
         if (DIR *d = opendir(p.c_str())) {
@@ -253,8 +267,7 @@ static bool rm_rf(const std::string &p) {
             closedir(d);
         }
         if (names.empty()) break;
-        ok = true;
-        for (auto &n : names) ok &= rm_rf(p + "/" + n);
+        for (auto &n : names) rm_rf(p + "/" + n);
     }
     if (rmdir(p.c_str()) == 0) return true;
     log_write("mtp: borrar: rmdir %s -> errno %d", p.c_str(), errno);
@@ -669,6 +682,7 @@ static bool op_delete(const Cmd &c) {
     std::string p;
     if (!full_path(*op, p)) return send_response(c.tid, RC_GeneralError);
     bool ok = rm_rf(p);
+    log_write("mtp: borrar %s -> %s", p.c_str(), ok ? "OK" : "FALLO");
     touch_save(*op);
     if (ok) op->alive = false;
     return send_response(c.tid, ok ? RC_OK : RC_AccessDenied);
