@@ -78,9 +78,34 @@ static constexpr u32 IO_TIMEOUT_MS = 30000;
 static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
 static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
 static u32 g_pending_len = 0;
-// En Switch 2 el USB rechaza los datos que llegan sin una lectura publicada, así
-// que la lectura de la fase de datos se publica en cuanto llega el comando.
-static bool g_preposted = false;
+// Canal PC -> consola: SIEMPRE hay una lectura publicada. En cuanto se completa
+// una, se publica la siguiente en el otro buffer antes de procesar nada. Así no
+// queda ni un instante en que el PC mande datos sin nadie escuchando (en Switch 2
+// eso parece hacer que Windows cancele la copia en el mismo milisegundo).
+static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
+static u8 *g_rx[2];
+static int g_rx_i = 0;          // buffer de la lectura publicada
+static bool g_rx_posted = false;
+
+static bool rx_post() {
+    if (g_rx_posted) return true;
+    if (!usb::begin_read(g_rx[g_rx_i], RX_SIZE)) return false;
+    g_rx_posted = true;
+    return true;
+}
+
+// Espera la lectura publicada, publica ya la siguiente y devuelve el buffer
+// recibido (válido hasta la siguiente llamada a rx_next).
+static usb::Status rx_next(u8 **buf, u32 *got, u32 timeout_ms) {
+    if (!rx_post()) return usb::Status::Error;
+    usb::Status st = usb::end_read(got, timeout_ms);
+    g_rx_posted = false;
+    if (st != usb::Status::Ok) return st;
+    *buf = g_rx[g_rx_i];
+    g_rx_i ^= 1;
+    if (!rx_post()) return usb::Status::Error;
+    return usb::Status::Ok;
+}
 
 static u64 now_ns() { return armTicksToNs(armGetSystemTick()); }
 
@@ -380,48 +405,42 @@ static bool send_data(const Cmd &c, const std::vector<u8> &payload) {
 // false = USB muerto. Si el PC cancela, g_aborted = true.
 static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
     u32 got = 0;
+    u8 *cur = nullptr;
     usb::Status st;
-    if (g_preposted) {
-        g_preposted = false;
-        st = usb::end_read(&got, 0);
-        while (st == usb::Status::Ok && got == 0) st = usb::read(g_buf, BUF_SIZE, &got, 0); // ZLP sobrante
-    } else {
-        do {
-            st = usb::read(g_buf, BUF_SIZE, &got, 0);
-        } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
-    }
+    do {
+        st = rx_next(&cur, &got, 0);
+    } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
     if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado por el PC antes de los datos"); return true; }
     if (st != usb::Status::Ok) return false;
-    if (rd16(g_buf + 4) != CT_DATA && looks_like_command(g_buf, got)) {
-        memcpy(g_pending_cmd, g_buf, got);
+    if (rd16(cur + 4) != CT_DATA && looks_like_command(cur, got)) {
+        memcpy(g_pending_cmd, cur, got);
         g_pending_len = got;
         g_aborted = true;
-        log_write("mtp: cancelado: llego el comando 0x%04X en vez de los datos", rd16(g_buf + 6));
+        log_write("mtp: cancelado: llego el comando 0x%04X en vez de los datos", rd16(cur + 6));
         return true;
     }
     if (got < 12) {
         g_aborted = true;
-        log_write("mtp: cancelado: primer bloque de datos de solo %u bytes (tipo %u)", got, got >= 6 ? rd16(g_buf + 4) : 0);
+        log_write("mtp: cancelado: primer bloque de datos de solo %u bytes (tipo %u)", got, got >= 6 ? rd16(cur + 4) : 0);
         return true;
     }
-    u32 len = rd32(g_buf);
+    u32 len = rd32(cur);
     bool unknown = len == 0xFFFFFFFF;
     u64 recvd = got;
-    log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u, primer bloque %u", rd16(g_buf + 4), rd16(g_buf + 6), len, got);
-    u8 *cur = g_buf;
+    log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u, primer bloque %u", rd16(cur + 4), rd16(cur + 6), len, got);
     u32 cur_n = got, cur_off = 12;
-    bool more = unknown ? got == BUF_SIZE : recvd < len;
+    bool more = unknown ? got == RX_SIZE : recvd < len;
     bool ok = true;
     for (;;) {
-        u8 *nxt = cur == g_buf ? g_buf2 : g_buf;
-        if (more && !usb::begin_read(nxt, BUF_SIZE)) return false;
+        // la siguiente lectura ya está publicada (rx_next): se escribe en la micro mientras llega
         if (ok) ok = sink(cur + cur_off, cur_n - cur_off);
         g_bytes += cur_n - cur_off;
         if (!more) break;
         u32 n = 0;
-        st = usb::end_read(&n, IO_TIMEOUT_MS);
+        u8 *nxt = nullptr;
+        st = rx_next(&nxt, &n, IO_TIMEOUT_MS);
         if (st == usb::Status::Error) return false;
-        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de enviar datos %u s (llevaba %llu de %u bytes)", IO_TIMEOUT_MS / 1000, (unsigned long long)recvd, len); return true; }
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de enviar datos (llevaba %llu de %u bytes)", (unsigned long long)recvd, len); return true; }
         if (n == 0) break;
         if (looks_like_command(nxt, n) && (unknown || len - recvd != n)) {
             memcpy(g_pending_cmd, nxt, n);
@@ -434,7 +453,7 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
         cur = nxt;
         cur_n = n;
         cur_off = 0;
-        more = unknown ? n == BUF_SIZE : recvd < len;
+        more = unknown ? n == RX_SIZE : recvd < len;
     }
     return true;
 }
@@ -1032,20 +1051,17 @@ static void session_loop() {
             g_pending_len = 0;
         } else {
             usb::clear_cancel();
-            usb::Status st = usb::read(g_cmd, 0x1000, &got);
+            u8 *b = nullptr;
+            usb::Status st = rx_next(&b, &got, 0);
             if (st == usb::Status::Timeout) { usb::clear_cancel(); continue; } // cancelación sin operación en curso
             if (st != usb::Status::Ok) return;
+            if (got > 0x1000) got = 0x1000;
+            memcpy(g_cmd, b, got);
         }
         if (got == 0) continue;
         if (got < 12 || rd16(g_cmd + 4) != CT_COMMAND) continue;
         Cmd c{};
         c.code = rd16(g_cmd + 6);
-        // Operaciones con datos del PC: publicar ya la lectura (ver g_preposted).
-        if (g_session && (c.code == OP_SendObjectInfo || c.code == OP_SendObject || c.code == OP_SendObjectPropList ||
-                          c.code == OP_SetObjectPropValue)) {
-            if (!usb::begin_read(g_buf, BUF_SIZE)) return;
-            g_preposted = true;
-        }
         c.tid = rd32(g_cmd + 8);
         c.np = std::min<int>((int)(got - 12) / 4, 5);
         for (int i = 0; i < c.np; i++) c.p[i] = rd32(g_cmd + 12 + 4 * i);
@@ -1060,7 +1076,11 @@ static void thread_main(void *) {
         if (!usb::wait_ready()) break;
         set_status("Cable conectado, esperando al PC...");
         log_write("mtp: cable conectado (paquete max %u)", usb::max_packet());
+        g_rx_posted = false;
+        g_rx_i = 0;
         session_loop();
+        usb::cancel_all();
+        g_rx_posted = false;
         log_write("mtp: sesion USB terminada (cable desconectado o error USB)");
         g_session = false;
         g_send.pending = false;
@@ -1075,8 +1095,10 @@ Result start(std::atomic<bool> *quit) {
     mutexInit(&g_status_mtx);
     g_buf = (u8 *)memalign(0x1000, BUF_SIZE);
     g_buf2 = (u8 *)memalign(0x1000, BUF_SIZE);
+    g_rx[0] = (u8 *)memalign(0x1000, RX_SIZE);
+    g_rx[1] = (u8 *)memalign(0x1000, RX_SIZE);
     g_cmd = (u8 *)memalign(0x1000, 0x1000);
-    if (!g_buf || !g_buf2 || !g_cmd) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (!g_buf || !g_buf2 || !g_cmd || !g_rx[0] || !g_rx[1]) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     mkdir("sdmc:/switch", 0777);
     Result rc = usb::init(quit);
     if (R_FAILED(rc)) { usb::exit(); return rc; }
@@ -1091,6 +1113,8 @@ void stop() {
     usb::exit();
     free(g_buf);
     free(g_buf2);
+    free(g_rx[0]);
+    free(g_rx[1]);
     free(g_cmd);
 }
 
