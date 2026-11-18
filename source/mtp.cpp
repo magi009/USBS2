@@ -243,7 +243,9 @@ static bool native_rm_dir(FsFileSystem *fs, const std::string &dir, int depth) {
     for (;;) {
         FsDirectoryEntry e[16];
         s64 n = 0;
-        if (R_FAILED(fsDirRead(&d, &n, 16, e)) || n <= 0) break;
+        Result rr = fsDirRead(&d, &n, 16, e);
+        if (R_FAILED(rr)) { log_write("mtp: borrar: leer %s fallo tras %u entradas -> 0x%X", dir.c_str(), (unsigned)ents.size(), rr); break; }
+        if (n <= 0) break;
         ents.insert(ents.end(), e, e + n);
     }
     fsDirClose(&d);
@@ -391,6 +393,22 @@ static std::string rd_str(const u8 *p, size_t avail, size_t *used) {
         u.push_back(c);
     }
     return utf16_to_8(u);
+}
+
+// Nombre seguro para la micro de la Switch 2: un archivo cuyo nombre lleva U+FFFD
+// (el "carácter desconocido" que deja Windows cuando un nombre se estropeó) o
+// caracteres de control rompe la lectura de TODA su carpeta: deja de listarse y no
+// se puede borrar. Se cambian por '_' (también los prohibidos en FAT).
+static std::string safe_name(const std::string &in) {
+    std::u16string u = utf8_to_16(in), o;
+    for (char16_t c : u) {
+        bool bad = c < 0x20 || c == 0xFFFD || c == 0xFFFE || c == 0xFFFF ||
+                   c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+        o.push_back(bad ? u'_' : c);
+    }
+    std::string r = utf16_to_8(o);
+    while (!r.empty() && (r.back() == ' ' || r.back() == '.')) r.pop_back();
+    return r.empty() ? std::string("_") : r;
 }
 
 static std::string mtp_date(time_t t) {
@@ -730,7 +748,8 @@ static bool op_delete(const Cmd &c) {
 static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; } g_send;
 
 // Crea el archivo/carpeta pedido por SendObjectInfo o SendObjectPropList y responde.
-static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name, u16 fmt, u64 size) {
+static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name_in, u16 fmt, u64 size) {
+    const std::string name = name_in.empty() ? name_in : safe_name(name_in);
     g_send.pending = false;
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
     for (unsigned char ch : name)
@@ -757,6 +776,12 @@ static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string 
     if (!full_path(parent, pp)) return send_response(c.tid, RC_GeneralError);
     std::string rel = join(parent.rel, name);
     std::string path = (pp.empty() || pp.back() == '/') ? pp + name : pp + "/" + name;
+    if (name != name_in) {
+        // Limpia la copia anterior con el nombre roto, si la hay (la que bloqueaba la carpeta).
+        std::string bad = (pp.empty() || pp.back() == '/') ? pp + name_in : pp + "/" + name_in;
+        int r = fmt == FMT_Association ? rmdir(bad.c_str()) : unlink(bad.c_str());
+        log_write("mtp: nombre corregido '%s' (antes con caracter invalido; borrar el viejo: %s)", name.c_str(), r == 0 ? "borrado" : "no estaba");
+    }
 
     if (fmt == FMT_Association) {
         if (mkdir(path.c_str(), 0777) != 0 && errno != EEXIST) return send_response(c.tid, RC_AccessDenied);
@@ -1043,6 +1068,7 @@ static bool op_set_prop_value(const Cmd &c) {
     if (op->rel.empty()) return send_response(c.tid, RC_AccessDenied);
     std::string name = data.empty() ? "" : rd_str(data.data(), data.size(), nullptr);
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_GeneralError);
+    name = safe_name(name);
     std::string from, base;
     if (!full_path(*op, from) || !base_path(op->storage, op->save, base)) return send_response(c.tid, RC_GeneralError);
     std::string old_rel = op->rel;
