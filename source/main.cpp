@@ -39,7 +39,7 @@ int main(int, char **) {
     }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.6.11 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.7.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
@@ -51,12 +51,12 @@ int main(int, char **) {
         step("[3] MODO SEGURO: partidas desactivadas");
     }
 
-    // Solo lectura: ¿tiene la consola activado USB 3 en modo dispositivo?
+    // Solo lectura: ajuste que en la Switch 1 activa USB 3 para homebrew (usb!usb30_force_enabled).
     if (R_SUCCEEDED(setsysInitialize())) {
-        bool f30 = false, fdev = false;
-        Result r1 = setsysGetUsb30EnableFlag(&f30);
-        Result r2 = setsysGetUsb30DeviceEnableFlag(&fdev);
-        log_write("    USB 3: general %s (0x%X), modo dispositivo %s (0x%X)", f30 ? "si" : "no", r1, fdev ? "si" : "no", r2);
+        u8 v = 0xFF; u64 sz = 0;
+        Result r = setsysGetSettingsItemValue("usb", "usb30_force_enabled", &v, sizeof(v), &sz);
+        if (R_SUCCEEDED(r)) log_write("    ajuste usb!usb30_force_enabled = %u", v);
+        else log_write("    ajuste usb!usb30_force_enabled: no existe (0x%X)", r);
         setsysExit();
     }
     step("[4] iniciando USB (usb:ds)...");
@@ -77,7 +77,7 @@ int main(int, char **) {
         }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.6.11 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.7.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);

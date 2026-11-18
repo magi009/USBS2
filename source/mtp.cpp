@@ -738,7 +738,7 @@ static bool op_delete(const Cmd &c) {
     std::string p;
     if (!full_path(*op, p)) return send_response(c.tid, RC_GeneralError);
     bool ok = rm_rf(p);
-    log_write("mtp: borrar %s -> %s", p.c_str(), ok ? "OK" : "FALLO");
+    if (!ok) log_write("mtp: no se pudo borrar %s", p.c_str());
     touch_save(*op);
     if (ok) op->alive = false;
     return send_response(c.tid, ok ? RC_OK : RC_AccessDenied);
@@ -752,13 +752,6 @@ static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string 
     const std::string name = name_in.empty() ? name_in : safe_name(name_in);
     g_send.pending = false;
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
-    for (unsigned char ch : name)
-        if (ch >= 0x80) {
-            char hex[3 * 64 + 1] = {0};
-            for (size_t k = 0; k < name.size() && k < 64; k++) snprintf(hex + 3 * k, 4, "%02X ", (u8)name[k]);
-            log_write("mtp: nombre con acentos/simbolos: %s", hex);
-            break;
-        }
 
     Obj parent{st, -1, "", 0, true};
     if (parent_h != ROOT && parent_h != 0) {

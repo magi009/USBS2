@@ -346,16 +346,6 @@ static const UsbDsReportEntry *find_entry(const UsbDsReportData &r, u32 urb) {
     return nullptr;
 }
 
-static void dump_report(const UsbDsReportData &r, const char *why) {
-    u32 c = r.report_count > 8 ? 8 : r.report_count;
-    log_write("    usb: informe OUT (%s): %u entradas", why, r.report_count);
-    for (u32 k = 0; k < c; k++)
-        log_write("        urb %u pedido %u recibido %u estado %u", r.report[k].id,
-                  r.report[k].requestedSize, r.report[k].transferredSize, r.report[k].urb_status);
-    for (int i = 0; i < g_rxq.n; i++)
-        log_write("        cola %d: urb %u %s (orden %u)%s", i, g_rxq.urb[i],
-                  g_rxq.posted[i] ? "publicada" : "libre", g_rxq.seq[i], i == g_rxq.head ? " <- cabeza" : "");
-}
 
 // Espera a que se complete una lectura de la cola (la más antigua que haya terminado).
 // Devuelve su índice; el buffer queda en manos del que llama hasta que haga rx_repost(índice).
@@ -367,7 +357,6 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
     for (int i = 0; i < g_rxq.n; i++) any |= g_rxq.posted[i];
     if (!any) return Status::Error;
     u64 waited_ms = 0;
-    bool dumped = false;
     for (;;) {
         UsbDsReportData report{};
         if (R_SUCCEEDED(usbDsEndpoint_GetReportData(g_ep_out, &report))) {
@@ -401,7 +390,7 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
                 // ¿quedó alguna publicada más antigua sin completar?
                 for (int k = 0; k < g_rxq.n; k++)
                     if (k != i && g_rxq.posted[k] && (s32)(g_rxq.seq[k] - g_rxq.seq[i]) < 0) {
-                        log_write("    usb: AVISO lectura fuera de orden (cola %d urb %u completo antes que cola %d urb %u)",
+                        log_debug("    usb: lectura fuera de orden (cola %d urb %u completo antes que cola %d urb %u)",
                                   i, g_rxq.urb[i], k, g_rxq.urb[k]);
                         break;
                     }
@@ -423,10 +412,6 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
                 *got = done;
                 return Status::Ok;
             }
-            if (!dumped && g_log_verbose && waited_ms >= 3000) {
-                dumped = true;
-                dump_report(report, "esperando datos 3 s");
-            }
         }
         Result rc = eventWait(&g_ep_out->CompletionEvent, 100'000'000ULL);
         if (R_SUCCEEDED(rc)) { eventClear(&g_ep_out->CompletionEvent); continue; }
@@ -439,8 +424,6 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
         }
         if (timeout_ms && waited_ms >= timeout_ms) return Status::Timeout;
         if (g_cancel_req.load()) {
-            UsbDsReportData r2;
-            if (R_SUCCEEDED(usbDsEndpoint_GetReportData(g_ep_out, &r2))) dump_report(r2, "cancelado por el PC");
             return Status::Timeout; // el PC canceló (Cancel Request)
         }
     }
