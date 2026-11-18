@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/statvfs.h>
 
 namespace mtp {
@@ -76,6 +77,23 @@ static constexpr u32 IO_TIMEOUT_MS = 5000;
 static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
 static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
 static u32 g_pending_len = 0;
+
+static u64 now_ns() { return armTicksToNs(armGetSystemTick()); }
+
+static void log_speed(const char *what, const std::string &path, u64 bytes, u64 t0, u64 sd_ns) {
+    if (bytes < (8ULL << 20)) return; // solo archivos de 8 MB o más
+    double secs = (now_ns() - t0) / 1e9, sd = sd_ns / 1e9;
+    log_write("%s %.1f MB en %.2f s = %.1f MB/s | micro: %.2f s (%.1f MB/s) | %s", what, bytes / 1048576.0, secs,
+              secs > 0 ? bytes / 1048576.0 / secs : 0.0, sd, sd > 0 ? bytes / 1048576.0 / sd : 0.0, path.c_str());
+}
+
+const char *link_name() {
+    switch (usb::max_packet()) {
+    case 0x400: return "USB 3 (5 Gb/s)";
+    case 0x40: return "USB 1.1 (12 Mb/s)";
+    default: return "USB 2.0 (480 Mb/s)";
+    }
+}
 
 void status(char *out, size_t size, u64 *bytes) {
     mutexLock(&g_status_mtx);
@@ -523,17 +541,23 @@ static bool op_object_info(const Cmd &c) {
 }
 
 static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 len) {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return send_response(c.tid, RC_AccessDenied);
-    static char *vbuf = (char *)malloc(1 << 20);
-    if (vbuf) setvbuf(f, vbuf, _IOFBF, 1 << 20);
-    if (offset) fseeko(f, (off_t)offset, SEEK_SET);
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return send_response(c.tid, RC_AccessDenied);
+    if (offset) lseek(fd, (off_t)offset, SEEK_SET);
     u64 total = 12 + len;
     u64 left = len;
+    u64 t0 = now_ns(), sd_ns = 0;
     auto fill = [&](u8 *b, u32 start) -> u32 {
         u32 want = (u32)std::min<u64>(BUF_SIZE - start, left);
-        size_t n = want ? fread(b + start, 1, want, f) : 0;
-        if (n < want) memset(b + start + n, 0, want - n); // archivo truncado: rellena para no romper el protocolo
+        u64 t = now_ns();
+        u32 got = 0;
+        while (got < want) {
+            ssize_t r = read(fd, b + start + got, want - got);
+            if (r <= 0) break;
+            got += (u32)r;
+        }
+        sd_ns += now_ns() - t;
+        if (got < want) memset(b + start + got, 0, want - got); // archivo truncado: rellena para no romper el protocolo
         left -= want;
         return start + want;
     };
@@ -554,10 +578,11 @@ static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 l
         cur = nxt;
         n = nn;
     }
-    fclose(f);
+    close(fd);
     set_status("Conectado al PC");
     if (dead) return false;
     if (g_aborted) return true;
+    log_speed("PC <- consola", path, len, t0, sd_ns);
     if (!send_zlp_if_needed(total)) return false;
     if (c.code == OP_GetPartialObject) return send_response(c.tid, RC_OK, {(u32)len});
     return send_response(c.tid, RC_OK);
@@ -591,7 +616,7 @@ static bool op_delete(const Cmd &c) {
 }
 
 // estado entre SendObjectInfo y SendObject
-static struct { bool pending = false; u32 handle = 0; std::string path; } g_send;
+static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; } g_send;
 
 static bool op_send_object_info(const Cmd &c) {
     u32 st = c.p[0], parent_h = c.np > 1 ? c.p[1] : ROOT;
@@ -631,6 +656,8 @@ static bool op_send_object_info(const Cmd &c) {
         g_send.pending = true;
         g_send.handle = h;
         g_send.path = path;
+        u32 sz = rd32(&data[8]);
+        g_send.size = sz == 0xFFFFFFFF ? 0 : sz; // >4 GB: tamaño desconocido aquí
     }
     return send_response(c.tid, RC_OK, {st, parent_h == 0 ? ROOT : parent_h, h});
 }
@@ -641,17 +668,30 @@ static bool op_send_object(const Cmd &c) {
         return send_response(c.tid, RC_NoValidObjectInfo);
     }
     g_send.pending = false;
-    FILE *f = fopen(g_send.path.c_str(), "wb");
-    static char *vbuf = (char *)malloc(1 << 20);
-    if (f && vbuf) setvbuf(f, vbuf, _IOFBF, 1 << 20);
-    bool werr = !f;
+    int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    bool werr = fd < 0;
+    // Reservar el tamaño final de una vez: la micro no tiene que ir agrandando el archivo.
+    bool presized = !werr && g_send.size && ftruncate(fd, (off_t)g_send.size) == 0;
+    u64 written = 0, t0 = now_ns(), sd_ns = 0;
     set_status("Recibiendo %s", g_send.path.c_str());
     bool ok = recv_data([&](const u8 *p, size_t n) {
         if (werr) return false;
-        if (n && fwrite(p, 1, n, f) != n) werr = true;
+        u64 t = now_ns();
+        size_t done = 0;
+        while (done < n) {
+            ssize_t r = write(fd, p + done, n - done);
+            if (r <= 0) { werr = true; break; }
+            done += (size_t)r;
+        }
+        sd_ns += now_ns() - t;
+        written += done;
         return !werr;
     });
-    if (f) fclose(f);
+    if (fd >= 0) {
+        if (presized && !g_aborted && written != g_send.size) ftruncate(fd, (off_t)written);
+        close(fd);
+    }
+    if (!g_aborted && !werr) log_speed("PC -> consola", g_send.path, written, t0, sd_ns);
     Obj *o = get_obj(g_send.handle);
     if (g_aborted) {
         unlink(g_send.path.c_str()); // copia cancelada: no dejar el archivo a medias

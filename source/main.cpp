@@ -31,9 +31,21 @@ int main(int, char **) {
     u64 held = padGetButtons(&pad);
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.3.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.4.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
+
+    // Solo lectura: ajustes de USB 3 de la consola (ayuda a saber por qué conecta a USB 2.0).
+    if (R_SUCCEEDED(setsysInitialize())) {
+        bool u30 = false, u30dev = false;
+        Result r1 = setsysGetUsb30EnableFlag(&u30);
+        Result r2 = setsysGetUsb30DeviceEnableFlag(&u30dev);
+        log_write("    ajuste USB 3.0: %s (0x%X) | USB 3.0 modo dispositivo: %s (0x%X)",
+                  u30 ? "si" : "no", r1, u30dev ? "si" : "no", r2);
+        setsysExit();
+    } else {
+        log_write("    ajustes USB 3.0: no se pudieron leer");
+    }
 
     static std::atomic<bool> quit{false};
     if (!safe) {
@@ -57,7 +69,7 @@ int main(int, char **) {
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.3.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.4.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -66,7 +78,17 @@ int main(int, char **) {
         } else {
             mtp::status(line, sizeof(line), &bytes);
             printf("Estado: %s\x1b[K\n\n", line);
-            printf("Transferido: %.1f MB\x1b[K\n\n", bytes / 1048576.0);
+            // velocidad media del último segundo
+            static u64 last_bytes = 0, last_tick = 0;
+            static double mbps = 0;
+            u64 now = armTicksToNs(armGetSystemTick());
+            if (now - last_tick >= 1'000'000'000ULL) {
+                mbps = last_tick ? (bytes - last_bytes) / 1048576.0 / ((now - last_tick) / 1e9) : 0;
+                last_bytes = bytes;
+                last_tick = now;
+            }
+            printf("Conexion: %s\x1b[K\n", mtp::link_name());
+            printf("Transferido: %.1f MB   Velocidad: %.1f MB/s\x1b[K\n\n", bytes / 1048576.0, mbps);
             printf("En el PC veras:\x1b[K\n");
             printf("  - Tarjeta SD           -> sdmc:/\x1b[K\n");
             printf("  - Homebrew             -> sdmc:/switch\x1b[K\n");
