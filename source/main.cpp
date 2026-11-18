@@ -19,6 +19,7 @@ static void step(const char *s) {
 
 int main(int, char **) {
     remove("sdmc:/USBS2.log");
+    log_write("[0] main() alcanzado, antes de la consola");
     consoleInit(nullptr);
     step("[1] consola iniciada");
 
@@ -31,8 +32,7 @@ int main(int, char **) {
     log_write("    firmware: %u.%u.%u", HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()));
     log_write("    applet type: %d", (int)appletGetAppletType());
 
-    step("[2] applet: evitar suspension");
-    appletSetMediaPlaybackState(true);
+    // [2] Sin llamadas al applet manager (am): el error 2128 apunta a ese servicio.
 
     static std::atomic<bool> quit{false};
     if (!safe) {
@@ -82,7 +82,6 @@ int main(int, char **) {
     quit = true;
     if (R_SUCCEEDED(rc)) mtp::stop();
     saves::exit();
-    appletSetMediaPlaybackState(false);
     consoleExit(nullptr);
     return 0;
 }
