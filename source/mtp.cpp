@@ -71,9 +71,10 @@ static char g_status[128] = "Esperando cable USB...";
 static std::atomic<u64> g_bytes{0};
 static bool g_session = false;
 
-// Si el PC deja de mandar/recibir datos este tiempo, se da la transferencia
-// por cancelada (Windows al pulsar "Cancelar") y se vuelve a esperar comandos.
-static constexpr u32 IO_TIMEOUT_MS = 5000;
+// Si el PC deja de mandar/recibir datos A MITAD de una transferencia durante
+// este tiempo, se da por cancelada y se vuelve a esperar comandos. (Al empezar
+// un archivo no hay límite: Windows puede tardar en tener los datos listos.)
+static constexpr u32 IO_TIMEOUT_MS = 30000;
 static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
 static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
 static u32 g_pending_len = 0;
@@ -320,7 +321,7 @@ static bool looks_like_command(const u8 *b, u32 got) {
 static bool usb_write(const void *b, u32 n) {
     if (g_aborted) return true;
     usb::Status st = usb::write(b, n, IO_TIMEOUT_MS);
-    if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de leer (cancelado)"); return true; }
+    if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de leer %u s", IO_TIMEOUT_MS / 1000); return true; }
     return st == usb::Status::Ok;
 }
 
@@ -378,14 +379,19 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
     u32 got = 0;
     usb::Status st;
     do {
-        st = usb::read(g_buf, BUF_SIZE, &got, IO_TIMEOUT_MS);
+        st = usb::read(g_buf, BUF_SIZE, &got, 0);
     } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
-    if (st == usb::Status::Error) return false;
-    if (st == usb::Status::Timeout || got < 12) { g_aborted = true; return true; }
+    if (st != usb::Status::Ok) return false;
     if (rd16(g_buf + 4) != CT_DATA && looks_like_command(g_buf, got)) {
         memcpy(g_pending_cmd, g_buf, got);
         g_pending_len = got;
         g_aborted = true;
+        log_write("mtp: cancelado: llego el comando 0x%04X en vez de los datos", rd16(g_buf + 6));
+        return true;
+    }
+    if (got < 12) {
+        g_aborted = true;
+        log_write("mtp: cancelado: primer bloque de datos de solo %u bytes (tipo %u)", got, got >= 6 ? rd16(g_buf + 4) : 0);
         return true;
     }
     u32 len = rd32(g_buf);
@@ -405,13 +411,13 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
         u32 n = 0;
         st = usb::end_read(&n, IO_TIMEOUT_MS);
         if (st == usb::Status::Error) return false;
-        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de enviar (cancelado)"); return true; }
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de enviar datos %u s (llevaba %llu de %u bytes)", IO_TIMEOUT_MS / 1000, (unsigned long long)recvd, len); return true; }
         if (n == 0) break;
         if (looks_like_command(nxt, n) && (unknown || len - recvd != n)) {
             memcpy(g_pending_cmd, nxt, n);
             g_pending_len = n;
             g_aborted = true;
-            log_write("mtp: llego un comando a mitad de la copia (cancelado)");
+            log_write("mtp: cancelado: llego el comando 0x%04X a mitad de la copia", rd16(nxt + 6));
             return true;
         }
         recvd += n;
@@ -576,7 +582,7 @@ static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 l
         u32 nn = left ? fill(nxt, 0) : 0; // lee de la micro mientras el USB envía
         usb::Status st = usb::end_write(IO_TIMEOUT_MS);
         if (st == usb::Status::Error) { dead = true; break; }
-        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de leer (cancelado)"); break; }
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de leer %u s", IO_TIMEOUT_MS / 1000); break; }
         g_bytes += n;
         if (nn == 0) break;
         cur = nxt;
@@ -632,7 +638,7 @@ static bool op_send_object_info(const Cmd &c) {
 
     u16 fmt = rd16(&data[4]);
     std::string name = rd_str(&data[52], data.size() - 52, nullptr);
-    log_write("mtp: SendObjectInfo '%s' formato 0x%04X tamano %u (almacen 0x%X, padre 0x%X, %u bytes de info)",
+    log_debug("mtp: SendObjectInfo '%s' formato 0x%04X tamano %u (almacen 0x%X, padre 0x%X, %u bytes de info)",
               name.c_str(), fmt, rd32(&data[8]), st, parent_h, (unsigned)data.size());
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
 
@@ -676,7 +682,8 @@ static bool op_send_object(const Cmd &c) {
     g_send.pending = false;
     int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     bool werr = fd < 0;
-    log_write("mtp: SendObject -> %s (abrir: %s, errno %d)", g_send.path.c_str(), fd >= 0 ? "OK" : "FALLA", fd >= 0 ? 0 : errno);
+    if (fd < 0) log_write("mtp: SendObject: no se pudo crear %s (errno %d)", g_send.path.c_str(), errno);
+    else log_debug("mtp: SendObject -> %s", g_send.path.c_str());
     // Reservar el tamaño final de una vez: la micro no tiene que ir agrandando el archivo.
     bool presized = !werr && g_send.size && ftruncate(fd, (off_t)g_send.size) == 0;
     u64 written = 0, t0 = now_ns(), sd_ns = 0;
@@ -698,7 +705,8 @@ static bool op_send_object(const Cmd &c) {
         if (presized && !g_aborted && written != g_send.size) ftruncate(fd, (off_t)written);
         close(fd);
     }
-    log_write("mtp: SendObject fin: %llu de %llu bytes, error escritura: %s, cancelado: %s, usb ok: %s",
+    bool problem = werr || g_aborted || !ok || (g_send.size && written != g_send.size);
+    if (problem || g_log_verbose) log_write("mtp: SendObject fin: %llu de %llu bytes, error escritura: %s, cancelado: %s, usb ok: %s",
               (unsigned long long)written, (unsigned long long)g_send.size, werr ? "si" : "no", g_aborted ? "si" : "no", ok ? "si" : "no");
     if (!g_aborted && !werr) log_speed("PC -> consola", g_send.path, written, t0, sd_ns);
     Obj *o = get_obj(g_send.handle);
