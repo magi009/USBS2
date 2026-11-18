@@ -4,6 +4,7 @@
 // Mantén R al abrir para el MODO SEGURO (sin partidas guardadas).
 #include <switch.h>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include "log.h"
 #include "mtp.h"
@@ -19,6 +20,7 @@ static void step(const char *s) {
 
 int main(int, char **) {
     remove("sdmc:/USBS2.log");
+    remove("sdmc:/switch/USBS2.log");
     log_write("[0] main() alcanzado, antes de la consola");
     consoleInit(nullptr);
     step("[1] consola iniciada");
@@ -31,6 +33,11 @@ int main(int, char **) {
     log_write("    modo seguro: %s", safe ? "si" : "no");
     log_write("    firmware: %u.%u.%u", HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()));
     log_write("    applet type: %d", (int)appletGetAppletType());
+    for (const char *p : {"sdmc:/USBS2.log", "sdmc:/switch/USBS2.log"}) {
+        FILE *f = fopen(p, "a");
+        log_write("    escribir %s: %s (errno %d)", p, f ? "OK" : "FALLA", f ? 0 : errno);
+        if (f) fclose(f);
+    }
 
     // [2] Sin llamadas al applet manager (am): el error 2128 apunta a ese servicio.
 
@@ -61,7 +68,8 @@ int main(int, char **) {
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
-            printf("Tu exploit/firmware puede no permitir usb:ds.\x1b[K\n");
+            printf("Registro (manda foto de esta pantalla):\x1b[K\n");
+            for (auto &l : log_tail(30)) printf("%.78s\x1b[K\n", l.c_str());
         } else {
             mtp::status(line, sizeof(line), &bytes);
             printf("Estado: %s\x1b[K\n\n", line);
