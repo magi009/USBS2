@@ -298,6 +298,8 @@ static struct {
     u32 urb[RXQ_MAX];
     bool posted[RXQ_MAX];
     u32 seq[RXQ_MAX];  // orden de publicación
+    bool fin[RXQ_MAX];  // completada (visto en un informe)
+    u32 fin_size[RXQ_MAX], fin_status[RXQ_MAX];
     u32 next_seq = 0;
     int n = 0;
     u32 size = 0;
@@ -310,6 +312,7 @@ bool rx_repost(int i) {
     Result rc = usbDsEndpoint_PostBufferAsync(g_ep_out, g_rxq.buf[i], g_rxq.size, &g_rxq.urb[i]);
     if (R_FAILED(rc)) { log_write("    usb: rx PostBufferAsync -> 0x%X", rc); return false; }
     g_rxq.posted[i] = true;
+    g_rxq.fin[i] = false;
     g_rxq.seq[i] = g_rxq.next_seq++;
     return true;
 }
@@ -332,7 +335,7 @@ void rx_stop() {
         eventWait(&g_ep_out->CompletionEvent, 1'000'000'000ULL);
         eventClear(&g_ep_out->CompletionEvent);
     }
-    for (int i = 0; i < g_rxq.n; i++) g_rxq.posted[i] = false;
+    for (int i = 0; i < g_rxq.n; i++) { g_rxq.posted[i] = false; g_rxq.fin[i] = false; }
     g_rxq.head = 0;
 }
 
@@ -356,8 +359,8 @@ static void dump_report(const UsbDsReportData &r, const char *why) {
 
 // Espera a que se complete una lectura de la cola (la más antigua que haya terminado).
 // Devuelve su índice; el buffer queda en manos del que llama hasta que haga rx_repost(índice).
-// Si una lectura posterior termina antes que la cabeza, se acepta igualmente: en la
-// Switch 2 hemos visto lecturas que nunca se completan mientras los datos llegan a otra.
+// En la Switch 2 cada finalización aparece en un solo informe: si no se guarda en ese
+// momento, esa lectura parece que nunca termina y sus datos se pierden.
 Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
     if (g_rxq.n == 0) return Status::Error;
     bool any = false;
@@ -366,33 +369,44 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
     u64 waited_ms = 0;
     bool dumped = false;
     for (;;) {
-        UsbDsReportData report;
+        UsbDsReportData report{};
         if (R_SUCCEEDED(usbDsEndpoint_GetReportData(g_ep_out, &report))) {
+            // El informe solo trae cada finalización una vez: se guardan todas las
+            // que aparezcan, aunque no sean la que buscamos ahora.
+            u32 cnt = report.report_count > 8 ? 8 : report.report_count;
+            for (u32 k = 0; k < cnt; k++) {
+                const UsbDsReportEntry &e = report.report[k];
+                if (e.urb_status < 3) continue;
+                for (int i = 0; i < g_rxq.n; i++)
+                    if (g_rxq.posted[i] && !g_rxq.fin[i] && g_rxq.urb[i] == e.id) {
+                        g_rxq.fin[i] = true;
+                        g_rxq.fin_size[i] = e.transferredSize;
+                        g_rxq.fin_status[i] = e.urb_status;
+                    }
+            }
+        }
+        {
             int best = -1;
             for (int i = 0; i < g_rxq.n; i++) {
-                if (!g_rxq.posted[i]) continue;
-                const UsbDsReportEntry *e = find_entry(report, g_rxq.urb[i]);
-                if (!e) continue;
-                if (e->urb_status == 4 || e->urb_status == 5) {
-                    log_write("    usb: rx urb %u estado %u", g_rxq.urb[i], e->urb_status);
-                    return Status::Error;
-                }
-                if (e->urb_status != 3) continue;
+                if (!g_rxq.posted[i] || !g_rxq.fin[i]) continue;
                 if (best < 0 || (s32)(g_rxq.seq[i] - g_rxq.seq[best]) < 0) best = i;
+            }
+            if (best >= 0 && g_rxq.fin_status[best] != 3) {
+                log_write("    usb: rx urb %u estado %u", g_rxq.urb[best], g_rxq.fin_status[best]);
+                return Status::Error;
             }
             if (best >= 0) {
                 int i = best;
-                const UsbDsReportEntry *e = find_entry(report, g_rxq.urb[i]);
-                u32 done = e->transferredSize;
+                u32 done = g_rxq.fin_size[i];
                 // ¿quedó alguna publicada más antigua sin completar?
                 for (int k = 0; k < g_rxq.n; k++)
                     if (k != i && g_rxq.posted[k] && (s32)(g_rxq.seq[k] - g_rxq.seq[i]) < 0) {
                         log_write("    usb: AVISO lectura fuera de orden (cola %d urb %u completo antes que cola %d urb %u)",
                                   i, g_rxq.urb[i], k, g_rxq.urb[k]);
-                        dump_report(report, "fuera de orden");
                         break;
                     }
                 g_rxq.posted[i] = false;
+                g_rxq.fin[i] = false;
                 // nueva cabeza = la publicada más antigua que quede
                 int h = -1;
                 for (int k = 0; k < g_rxq.n; k++)
