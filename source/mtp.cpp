@@ -324,8 +324,11 @@ static bool usb_write(const void *b, u32 n) {
     return st == usb::Status::Ok;
 }
 
+static u16 g_cur_op = 0;
+
 static bool send_response(u32 tid, u16 code, std::initializer_list<u32> params = {}) {
     if (g_aborted) return true; // el PC abandonó esta operación: no se responde
+    if (code != RC_OK) log_write("mtp: op 0x%04X -> respuesta 0x%04X", g_cur_op, code);
     u32 len = 12 + 4 * (u32)params.size();
     u8 *b = g_cmd;
     memset(b, 0, len);
@@ -388,6 +391,7 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
     u32 len = rd32(g_buf);
     bool unknown = len == 0xFFFFFFFF;
     u64 recvd = got;
+    log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u, primer bloque %u", rd16(g_buf + 4), rd16(g_buf + 6), len, got);
     u8 *cur = g_buf;
     u32 cur_n = got, cur_off = 12;
     bool more = unknown ? got == BUF_SIZE : recvd < len;
@@ -628,6 +632,8 @@ static bool op_send_object_info(const Cmd &c) {
 
     u16 fmt = rd16(&data[4]);
     std::string name = rd_str(&data[52], data.size() - 52, nullptr);
+    log_write("mtp: SendObjectInfo '%s' formato 0x%04X tamano %u (almacen 0x%X, padre 0x%X, %u bytes de info)",
+              name.c_str(), fmt, rd32(&data[8]), st, parent_h, (unsigned)data.size());
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
 
     Obj parent{st, -1, "", 0, true};
@@ -670,6 +676,7 @@ static bool op_send_object(const Cmd &c) {
     g_send.pending = false;
     int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     bool werr = fd < 0;
+    log_write("mtp: SendObject -> %s (abrir: %s, errno %d)", g_send.path.c_str(), fd >= 0 ? "OK" : "FALLA", fd >= 0 ? 0 : errno);
     // Reservar el tamaño final de una vez: la micro no tiene que ir agrandando el archivo.
     bool presized = !werr && g_send.size && ftruncate(fd, (off_t)g_send.size) == 0;
     u64 written = 0, t0 = now_ns(), sd_ns = 0;
@@ -691,6 +698,8 @@ static bool op_send_object(const Cmd &c) {
         if (presized && !g_aborted && written != g_send.size) ftruncate(fd, (off_t)written);
         close(fd);
     }
+    log_write("mtp: SendObject fin: %llu de %llu bytes, error escritura: %s, cancelado: %s, usb ok: %s",
+              (unsigned long long)written, (unsigned long long)g_send.size, werr ? "si" : "no", g_aborted ? "si" : "no", ok ? "si" : "no");
     if (!g_aborted && !werr) log_speed("PC -> consola", g_send.path, written, t0, sd_ns);
     Obj *o = get_obj(g_send.handle);
     if (g_aborted) {
@@ -902,6 +911,7 @@ static bool op_refs(const Cmd &c) {
 
 static bool dispatch(const Cmd &c) {
     g_aborted = false;
+    g_cur_op = c.code;
     if (c.code != OP_GetObjectPropValue && c.code != OP_GetObjectInfo)
         log_debug("mtp: op 0x%04X tid %u p0 0x%X", c.code, c.tid, c.np ? c.p[0] : 0);
     if (c.code == OP_GetDeviceInfo) return op_device_info(c);
@@ -970,7 +980,7 @@ static void thread_main(void *) {
         set_status("Cable conectado, esperando al PC...");
         log_write("mtp: cable conectado (paquete max %u)", usb::max_packet());
         session_loop();
-        log_write("mtp: sesion USB terminada");
+        log_write("mtp: sesion USB terminada (cable desconectado o error USB)");
         g_session = false;
         g_send.pending = false;
         saves::unmount_all();
