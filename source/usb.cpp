@@ -60,6 +60,46 @@ static std::atomic<u32> g_setup_count{0};
 
 u32 setup_count() { return g_setup_count.load(); }
 
+// Comando IDsInterface sin argumentos (para probar números en Switch 2).
+static Result intf_cmd_noio(u32 cmd) {
+    serviceAssumeDomain(&g_intf->s);
+    return serviceDispatch(&g_intf->s, cmd);
+}
+
+// Contesta una petición de control. En Switch 2 los números de comando de
+// IDsInterface cambiaron; se anota cada intento antes de hacerlo.
+static void handle_setup() {
+    alignas(0x1000) static u8 pkt[0x1000];
+    alignas(0x1000) static u8 data[0x1000];
+    memset(pkt, 0, 8);
+    log_write("    usb: control: leyendo peticion (GetSetupPacket, cmd 2)...");
+    Result rc = usbDsInterface_GetSetupPacket(g_intf, pkt, 8);
+    log_write("    usb: control: GetSetupPacket -> 0x%X | %02X %02X %02X %02X %02X %02X %02X %02X", rc, pkt[0], pkt[1],
+              pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7]);
+    if (R_FAILED(rc)) return;
+
+    u8 type = pkt[0], req = pkt[1];
+    u16 wLength = pkt[6] | (pkt[7] << 8);
+    if (type == 0xA1 && req == 0x67) {
+        // MTP "Get Device Status": respuesta = largo (4) + código OK (0x2001)
+        data[0] = 4; data[1] = 0; data[2] = 0x01; data[3] = 0x20;
+        u32 n = wLength < 4 ? wLength : 4;
+        u32 urb = 0;
+        log_write("    usb: control: GET_DEVICE_STATUS -> enviando OK (CtrlIn, cmd 3, %u bytes)...", n);
+        rc = usbDsInterface_CtrlInPostBufferAsync(g_intf, data, n, &urb);
+        log_write("    usb: control: CtrlIn -> 0x%X (urb %u)", rc, urb);
+        svcSleepThread(20'000'000ULL);
+        log_write("    usb: control: estado (CtrlOut 0 bytes, cmd 4)...");
+        rc = usbDsInterface_CtrlOutPostBufferAsync(g_intf, data, 0, &urb);
+        log_write("    usb: control: CtrlOut -> 0x%X (urb %u)", rc, urb);
+        return;
+    }
+    // Cualquier otra petición: rechazar (STALL) para que el PC no espere.
+    log_write("    usb: control: peticion desconocida, rechazando (cmd 5)...");
+    rc = intf_cmd_noio(5);
+    log_write("    usb: control: rechazo cmd 5 -> 0x%X", rc);
+}
+
 static void setup_watch(void *) {
     while (!g_quit->load()) {
         if (!g_intf) { svcSleepThread(100'000'000ULL); continue; }
@@ -68,6 +108,7 @@ static void setup_watch(void *) {
         eventClear(&g_intf->SetupEvent);
         u32 n = ++g_setup_count;
         log_write("    usb: PETICION DE CONTROL #%u recibida (canal de control)", n);
+        handle_setup();
     }
 }
 
