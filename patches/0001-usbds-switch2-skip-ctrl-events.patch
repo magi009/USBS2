@@ -1,0 +1,44 @@
+diff --git a/nx/source/services/usbds.c b/nx/source/services/usbds.c
+index e19875a..9dbae49 100644
+--- a/nx/source/services/usbds.c
++++ b/nx/source/services/usbds.c
+@@ -424,12 +424,19 @@ Result usbDsRegisterInterface(UsbDsInterface** interface) {
+     // GetSetupEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->SetupEvent, false, 1);
++#ifndef __SWITCH2__
+     // GetCtrlInCompletionEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->CtrlInCompletionEvent, false, hosversionAtLeast(11,0,0) ? 5 : 7);
+     // GetCtrlOutCompletionEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->CtrlOutCompletionEvent, false, hosversionAtLeast(11,0,0) ? 7 : 9);
++#else
++    // Switch 2 (firmware 23.0.1): IDsInterface cmd 5 (GetCtrlInCompletionEvent)
++    // returns 0x4BB25 and cmd 7 closes the session, so the control-transfer
++    // events are not requested. They are only needed for control transfers
++    // (usbDsInterface_CtrlIn/OutPostBufferAsync), not for bulk endpoints.
++#endif
+ 
+     if (R_FAILED(rc))
+         _usbDsFreeInterface(ptr);
+@@ -451,12 +458,19 @@ Result usbDsRegisterInterfaceEx(UsbDsInterface** interface, u8 intf_num) {
+     // GetSetupEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->SetupEvent, false, 1);
++#ifndef __SWITCH2__
+     // GetCtrlInCompletionEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->CtrlInCompletionEvent, false, hosversionAtLeast(11,0,0) ? 5 : 7);
+     // GetCtrlOutCompletionEvent
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&ptr->s, &ptr->CtrlOutCompletionEvent, false, hosversionAtLeast(11,0,0) ? 7 : 9);
++#else
++    // Switch 2 (firmware 23.0.1): IDsInterface cmd 5 (GetCtrlInCompletionEvent)
++    // returns 0x4BB25 and cmd 7 closes the session, so the control-transfer
++    // events are not requested. They are only needed for control transfers
++    // (usbDsInterface_CtrlIn/OutPostBufferAsync), not for bulk endpoints.
++#endif
+ 
+     if (R_FAILED(rc))
+         _usbDsFreeInterface(ptr);

@@ -1,4 +1,4 @@
-// usbprobe 5 - Mapa de comandos de IDsInterface en Switch 2, con una conexión
+// usbprobe 6 - Busca AppendConfigurationData. (antes: usbprobe 5 - Mapa de comandos de IDsInterface en Switch 2, con una conexión
 // NUEVA para cada prueba (en la sonda 4 la primera llamada cerró la sesión y
 // contaminó todo lo demás con 0xF601).
 // Resultado en pantalla y en sdmc:/switch/usbprobe.log
@@ -121,24 +121,18 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
 
     g_log = fopen("sdmc:/switch/usbprobe.log", "w");
-    out("usbprobe 5 - IDsInterface con sesion nueva por prueba");
+    out("usbprobe 6 - buscar AppendConfigurationData");
 
-    out("== Eventos (sin entrada, devuelve handle) ==");
-    for (u32 cmd = 1; cmd <= 14; cmd++) {
-        if (cmd == 3 || cmd == 4 || cmd == 10 || cmd == 12) continue; // necesitan buffers
-        test_event(cmd);
-    }
+    out("== Control: comando inexistente (100) ==");
+    test_event(100);
 
-    out("== AppendConfigurationData ==");
-    test_append(10, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
-    test_append(10, SfBufferAttr_HipcPointer | SfBufferAttr_In, "Pointer", false);
-    test_append(10, SfBufferAttr_HipcAutoSelect | SfBufferAttr_In, "AutoSelect", false);
-    test_append(12, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", true);
-    test_append(11, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
-    test_append(13, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
+    out("== Append (u32 velocidad + buffer MapAlias) cmd 2..30 ==");
+    for (u32 cmd = 2; cmd <= 30; cmd++)
+        test_append(cmd, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", false);
 
-    out("== RegisterEndpoint ==");
-    test_register_endpoint(0);
+    out("== Append (u8 interfaz, u32 velocidad + MapAlias) cmd 2..30 ==");
+    for (u32 cmd = 2; cmd <= 30; cmd++)
+        test_append(cmd, SfBufferAttr_HipcMapAlias | SfBufferAttr_In, "MapAlias", true);
 
     out("");
     out("Listo. Log: sdmc:/switch/usbprobe.log");
