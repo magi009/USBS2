@@ -22,7 +22,7 @@ La última compilación está siempre en **Releases → latest** (`USBS2.nro`).
 
 Botones al abrir la app (mantenlos mientras la abres):
 - **R** – modo seguro: sin partidas guardadas.
-- **ZL** – registro detallado: anota cada operación en `USBS2.log` (más lento; solo para diagnosticar).
+- **ZL** – registro detallado: anota cada operación en `USBS2.log` (más lento; solo para diagnosticar). Con la app abierta, **Y** lo activa o desactiva.
 
 El registro está en `sdmc:/switch/USBS2.log`. Si el USB no arranca, el error también sale en pantalla.
 

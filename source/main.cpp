@@ -27,25 +27,18 @@ int main(int, char **) {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
-    padUpdate(&pad);
-    u64 held = padGetButtons(&pad);
+    // El control tarda unos fotogramas en reportar botones: se mira durante ~0,5 s.
+    u64 held = 0;
+    for (int i = 0; i < 10; i++) {
+        padUpdate(&pad);
+        held |= padGetButtons(&pad);
+        svcSleepThread(50'000'000ULL);
+    }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.4.1 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.4.2 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
-
-    // Solo lectura: ajustes de USB 3 de la consola (ayuda a saber por qué conecta a USB 2.0).
-    if (R_SUCCEEDED(setsysInitialize())) {
-        bool u30 = false, u30dev = false;
-        Result r1 = setsysGetUsb30EnableFlag(&u30);
-        Result r2 = setsysGetUsb30DeviceEnableFlag(&u30dev);
-        log_write("    ajuste USB 3.0: %s (0x%X) | USB 3.0 modo dispositivo: %s (0x%X)",
-                  u30 ? "si" : "no", r1, u30dev ? "si" : "no", r2);
-        setsysExit();
-    } else {
-        log_write("    ajustes USB 3.0: no se pudieron leer");
-    }
 
     static std::atomic<bool> quit{false};
     if (!safe) {
@@ -67,9 +60,13 @@ int main(int, char **) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
+        if (down & HidNpadButton_Y) {
+            g_log_verbose = !g_log_verbose;
+            log_write("registro detallado: %s (boton Y)", g_log_verbose ? "ACTIVADO" : "desactivado");
+        }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.4.1 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.4.2 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -95,7 +92,7 @@ int main(int, char **) {
             printf("  - Partidas guardadas   -> una carpeta por juego/usuario\x1b[K\n\n");
             printf("Cierra los juegos antes de tocar sus partidas.\x1b[K\n");
         }
-        printf("\nRegistro: sdmc:/switch/USBS2.log\x1b[K\n");
+        printf("\nRegistro: sdmc:/switch/USBS2.log   Detallado: %s (Y = cambiar)\x1b[K\n", g_log_verbose ? "SI" : "no");
         printf("Pulsa + o B para salir.\x1b[K\n");
         consoleUpdate(nullptr);
         svcSleepThread(50'000'000ULL);
