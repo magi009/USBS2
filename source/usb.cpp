@@ -11,6 +11,11 @@ static std::atomic<bool> *g_quit = nullptr;
 
 #define TRY(call) do { rc = (call); log_write("    usb: %s -> 0x%X", #call, rc); if (R_FAILED(rc)) return rc; } while (0)
 
+static Result log_rc(const char *what, Result rc) {
+    log_write("    usb: %s -> 0x%X", what, rc);
+    return rc;
+}
+
 static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, u8 addr_irq) {
     Result rc;
     u16 bulk_mps = speed == UsbDeviceSpeed_Full ? 0x40 : (speed == UsbDeviceSpeed_High ? 0x200 : 0x400);
@@ -28,22 +33,22 @@ static Result add_endpoint_descs(UsbDeviceSpeed speed, u8 addr_in, u8 addr_out, 
 
     // Bulk IN
     ep.bEndpointAddress = addr_in;
-    if (R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE))) return rc;
-    if (speed == UsbDeviceSpeed_Super && R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp)))) return rc;
+    if (R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE)))) return rc;
+    if (speed == UsbDeviceSpeed_Super && R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp))))) return rc;
     // Bulk OUT
     ep.bEndpointAddress = addr_out;
-    if (R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE))) return rc;
-    if (speed == UsbDeviceSpeed_Super && R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp)))) return rc;
+    if (R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE)))) return rc;
+    if (speed == UsbDeviceSpeed_Super && R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp))))) return rc;
     // Interrupt IN (eventos MTP)
     ep.bEndpointAddress = addr_irq;
     ep.bmAttributes = USB_TRANSFER_TYPE_INTERRUPT;
     ep.wMaxPacketSize = 0x1C;
     ep.bInterval = 6;
-    if (R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE))) return rc;
+    if (R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &ep, USB_DT_ENDPOINT_SIZE)))) return rc;
     if (speed == UsbDeviceSpeed_Super) {
         comp.bMaxBurst = 0;
         comp.wBytesPerInterval = 0x1C;
-        if (R_FAILED(rc = usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp)))) return rc;
+        if (R_FAILED(rc = log_rc("append", usbDsInterface_AppendConfigurationData(g_intf, speed, &comp, sizeof(comp))))) return rc;
     }
     return 0;
 }
@@ -53,13 +58,39 @@ Result init(std::atomic<bool> *quit_flag) {
     Result rc;
     TRY(usbDsInitialize());
 
+    // Switch 2: la interfaz se registra ANTES de cualquier descriptor del
+    // dispositivo; si se ponen primero los textos/descriptores (orden de la
+    // Switch 1), usb:ds rechaza el registro con 0x4BB25.
+    TRY(usbDsRegisterInterface(&g_intf));
+
+    usb_interface_descriptor intf{};
+    intf.bLength = USB_DT_INTERFACE_SIZE;
+    intf.bDescriptorType = USB_DT_INTERFACE;
+    intf.bInterfaceNumber = g_intf->interface_index;
+    intf.bNumEndpoints = 3;
+    intf.bInterfaceClass = 0x06;    // Still Image
+    intf.bInterfaceSubClass = 0x01; // MTP
+    intf.bInterfaceProtocol = 0x01;
+    intf.iInterface = 0;
+
+    const u8 addr_in = USB_ENDPOINT_IN + 1, addr_out = USB_ENDPOINT_OUT + 1, addr_irq = USB_ENDPOINT_IN + 2;
+    const UsbDeviceSpeed speeds[3] = {UsbDeviceSpeed_Full, UsbDeviceSpeed_High, UsbDeviceSpeed_Super};
+    for (auto sp : speeds) {
+        TRY(usbDsInterface_AppendConfigurationData(g_intf, sp, &intf, USB_DT_INTERFACE_SIZE));
+        TRY(add_endpoint_descs(sp, addr_in, addr_out, addr_irq));
+    }
+
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_in, addr_in));
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_out, addr_out));
+    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_irq, addr_irq));
+    TRY(usbDsInterface_EnableInterface(g_intf));
+
     static const u16 langs[1] = {0x0409};
-    u8 iManufacturer, iProduct, iSerial, iInterface;
+    u8 iManufacturer, iProduct, iSerial;
     TRY(usbDsAddUsbLanguageStringDescriptor(nullptr, langs, 1));
     TRY(usbDsAddUsbStringDescriptor(&iManufacturer, "Nintendo"));
     TRY(usbDsAddUsbStringDescriptor(&iProduct, "Switch 2 (USBS2)"));
     TRY(usbDsAddUsbStringDescriptor(&iSerial, "USBS2-0001"));
-    TRY(usbDsAddUsbStringDescriptor(&iInterface, "MTP"));
 
     usb_device_descriptor dev{};
     dev.bLength = USB_DT_DEVICE_SIZE;
@@ -86,30 +117,6 @@ Result init(std::atomic<bool> *quit_flag) {
         0x0A, 0x10, 0x03, 0x00, 0x0E, 0x00, 0x03, 0x00, 0x00, 0x00,
     };
     TRY(usbDsSetBinaryObjectStore(bos, sizeof(bos)));
-
-    TRY(usbDsRegisterInterface(&g_intf));
-
-    usb_interface_descriptor intf{};
-    intf.bLength = USB_DT_INTERFACE_SIZE;
-    intf.bDescriptorType = USB_DT_INTERFACE;
-    intf.bInterfaceNumber = g_intf->interface_index;
-    intf.bNumEndpoints = 3;
-    intf.bInterfaceClass = 0x06;    // Still Image
-    intf.bInterfaceSubClass = 0x01; // MTP
-    intf.bInterfaceProtocol = 0x01;
-    intf.iInterface = iInterface;
-
-    const u8 addr_in = USB_ENDPOINT_IN + 1, addr_out = USB_ENDPOINT_OUT + 1, addr_irq = USB_ENDPOINT_IN + 2;
-    const UsbDeviceSpeed speeds[3] = {UsbDeviceSpeed_Full, UsbDeviceSpeed_High, UsbDeviceSpeed_Super};
-    for (auto sp : speeds) {
-        TRY(usbDsInterface_AppendConfigurationData(g_intf, sp, &intf, USB_DT_INTERFACE_SIZE));
-        TRY(add_endpoint_descs(sp, addr_in, addr_out, addr_irq));
-    }
-
-    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_in, addr_in));
-    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_out, addr_out));
-    TRY(usbDsInterface_RegisterEndpoint(g_intf, &g_ep_irq, addr_irq));
-    TRY(usbDsInterface_EnableInterface(g_intf));
     TRY(usbDsEnable());
     return 0;
 }

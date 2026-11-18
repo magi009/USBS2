@@ -1,6 +1,5 @@
-// usbprobe - Sonda del servicio usb:ds en Switch 2 (KaiHEN / libounce).
-// Prueba combinaciones de "complex id", números de interfaz y comandos para
-// descubrir cómo hay que registrar una interfaz USB-dispositivo en Switch 2.
+// usbprobe 2 - Busca qué paso de configuración de usb:ds impide registrar una
+// interfaz en Switch 2, y prueba la secuencia completa "registrar primero".
 // Resultado en pantalla y en sdmc:/switch/usbprobe.log
 #include <stdarg.h>
 #include <stdio.h>
@@ -15,64 +14,126 @@ static void out(const char *fmt, ...) {
     va_start(va, fmt);
     vsnprintf(line, sizeof(line), fmt, va);
     va_end(va);
-    printf("%s\n", line);
+    printf("%.79s\n", line);
     consoleUpdate(NULL);
     if (g_log) { fprintf(g_log, "%s\n", line); fflush(g_log); }
 }
 
-static const char *fmt_rc(Result rc) {
-    static char b[4][40];
-    static int i;
-    i = (i + 1) & 3;
-    if (rc == 0) snprintf(b[i], sizeof(b[i]), "OK");
-    else snprintf(b[i], sizeof(b[i]), "0x%X (%04u-%04u)", rc, 2000 + R_MODULE(rc), R_DESCRIPTION(rc));
-    return b[i];
-}
+#define STEP(name, call) do { Result _r = (call); out("  %-28s -> 0x%X", name, _r); if (R_FAILED(_r)) goto done; } while (0)
 
-typedef struct { Service root, ds; bool open; } Ds;
+static const u16 g_langs[1] = {0x0409};
+static const u8 g_bos[0x16] = {
+    0x05, 0x0F, 0x16, 0x00, 0x02,
+    0x07, 0x10, 0x02, 0x02, 0x00, 0x00, 0x00,
+    0x0A, 0x10, 0x03, 0x00, 0x0E, 0x00, 0x03, 0x00, 0x00, 0x00,
+};
 
-static Result ds_open(Ds *d) {
+static void dev_desc(struct usb_device_descriptor *d, u16 bcd, u8 mps0) {
     memset(d, 0, sizeof(*d));
-    Result rc = smGetService(&d->root, "usb:ds");
-    if (R_FAILED(rc)) return rc;
-    rc = serviceConvertToDomain(&d->root);
-    if (R_FAILED(rc)) { serviceClose(&d->root); return rc; }
-    serviceAssumeDomain(&d->root);
-    rc = serviceDispatch(&d->root, 0, .out_num_objects = 1, .out_objects = &d->ds);
-    if (R_FAILED(rc)) { serviceClose(&d->root); return rc; }
-    d->open = true;
-    return 0;
+    d->bLength = USB_DT_DEVICE_SIZE;
+    d->bDescriptorType = USB_DT_DEVICE;
+    d->bcdUSB = bcd;
+    d->bMaxPacketSize0 = mps0;
+    d->idVendor = 0x057E;
+    d->idProduct = 0x201D;
+    d->bcdDevice = 0x0100;
+    d->bNumConfigurations = 1;
 }
 
-static void ds_close(Ds *d) {
-    if (!d->open) return;
-    serviceAssumeDomain(&d->ds);
-    serviceClose(&d->ds);
-    serviceClose(&d->root);
-    d->open = false;
+// Ejecuta los primeros `upto` pasos de configuración y luego intenta registrar.
+static void test_prefix(int upto) {
+    static const char *names[] = {"(nada)", "+idioma", "+texto", "+desc Full", "+desc High", "+desc Super", "+BOS"};
+    out("T%d: init %s, luego registrar", upto, names[upto]);
+    UsbDsInterface *intf = NULL;
+    u8 idx;
+    struct usb_device_descriptor d;
+    STEP("usbDsInitialize", usbDsInitialize());
+    if (upto >= 1) STEP("AddLanguageString", usbDsAddUsbLanguageStringDescriptor(NULL, g_langs, 1));
+    if (upto >= 2) STEP("AddString", usbDsAddUsbStringDescriptor(&idx, "Nintendo"));
+    if (upto >= 3) { dev_desc(&d, 0x0110, 0x40); STEP("SetDeviceDesc Full", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Full, &d)); }
+    if (upto >= 4) { dev_desc(&d, 0x0200, 0x40); STEP("SetDeviceDesc High", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_High, &d)); }
+    if (upto >= 5) { dev_desc(&d, 0x0300, 0x09); STEP("SetDeviceDesc Super", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Super, &d)); }
+    if (upto >= 6) STEP("SetBinaryObjectStore", usbDsSetBinaryObjectStore(g_bos, sizeof(g_bos)));
+    STEP("RegisterInterface", usbDsRegisterInterface(&intf));
+done:
+    usbDsExit();
 }
 
-static Result ds_bind(Ds *d, u32 complex_id) {
-    serviceAssumeDomain(&d->ds);
-    return serviceDispatchIn(&d->ds, 0, complex_id,
-        .in_num_handles = 1,
-        .in_handles = { CUR_PROCESS_HANDLE },
-    );
-}
+// Secuencia completa con el registro primero (lo que usará USBS2).
+static void test_register_first(void) {
+    out("T7: registrar PRIMERO y configurar despues");
+    UsbDsInterface *intf = NULL;
+    UsbDsEndpoint *ep_in = NULL, *ep_out = NULL, *ep_irq = NULL;
+    u8 iMan, iProd, iSer;
+    struct usb_device_descriptor d;
 
-static Result ds_register_u8(Ds *d, u8 intf, Service *out_intf) {
-    serviceAssumeDomain(&d->ds);
-    return serviceDispatchIn(&d->ds, 1, intf, .out_num_objects = 1, .out_objects = out_intf);
-}
+    STEP("usbDsInitialize", usbDsInitialize());
+    STEP("RegisterInterface", usbDsRegisterInterface(&intf));
+    out("  (interfaz numero %u)", intf->interface_index);
 
-static Result ds_register_u32(Ds *d, u32 intf, Service *out_intf) {
-    serviceAssumeDomain(&d->ds);
-    return serviceDispatchIn(&d->ds, 1, intf, .out_num_objects = 1, .out_objects = out_intf);
-}
+    struct usb_interface_descriptor id = {0};
+    id.bLength = USB_DT_INTERFACE_SIZE;
+    id.bDescriptorType = USB_DT_INTERFACE;
+    id.bInterfaceNumber = intf->interface_index;
+    id.bNumEndpoints = 3;
+    id.bInterfaceClass = 0x06;
+    id.bInterfaceSubClass = 0x01;
+    id.bInterfaceProtocol = 0x01;
 
-static void close_intf(Service *s) {
-    serviceAssumeDomain(s);
-    serviceClose(s);
+    struct usb_endpoint_descriptor ep = {0};
+    ep.bLength = USB_DT_ENDPOINT_SIZE;
+    ep.bDescriptorType = USB_DT_ENDPOINT;
+
+    struct usb_ss_endpoint_companion_descriptor comp = {0};
+    comp.bLength = sizeof(comp);
+    comp.bDescriptorType = USB_DT_SS_ENDPOINT_COMPANION;
+
+    const UsbDeviceSpeed speeds[3] = {UsbDeviceSpeed_Full, UsbDeviceSpeed_High, UsbDeviceSpeed_Super};
+    const u16 mps[3] = {0x40, 0x200, 0x400};
+    for (int s = 0; s < 3; s++) {
+        bool ss = speeds[s] == UsbDeviceSpeed_Super;
+        STEP("Append intf", usbDsInterface_AppendConfigurationData(intf, speeds[s], &id, USB_DT_INTERFACE_SIZE));
+        const u8 addrs[3] = {USB_ENDPOINT_IN + 1, USB_ENDPOINT_OUT + 1, USB_ENDPOINT_IN + 2};
+        for (int e = 0; e < 3; e++) {
+            ep.bEndpointAddress = addrs[e];
+            ep.bmAttributes = e < 2 ? USB_TRANSFER_TYPE_BULK : USB_TRANSFER_TYPE_INTERRUPT;
+            ep.wMaxPacketSize = e < 2 ? mps[s] : 0x1C;
+            ep.bInterval = e < 2 ? 0 : 6;
+            STEP("Append endpoint", usbDsInterface_AppendConfigurationData(intf, speeds[s], &ep, USB_DT_ENDPOINT_SIZE));
+            if (ss) {
+                comp.bMaxBurst = e < 2 ? 0x0F : 0;
+                comp.wBytesPerInterval = e < 2 ? 0 : 0x1C;
+                STEP("Append companion", usbDsInterface_AppendConfigurationData(intf, speeds[s], &comp, sizeof(comp)));
+            }
+        }
+        out("  velocidad %d configurada", (int)speeds[s]);
+    }
+    STEP("RegisterEndpoint IN", usbDsInterface_RegisterEndpoint(intf, &ep_in, USB_ENDPOINT_IN + 1));
+    STEP("RegisterEndpoint OUT", usbDsInterface_RegisterEndpoint(intf, &ep_out, USB_ENDPOINT_OUT + 1));
+    STEP("RegisterEndpoint IRQ", usbDsInterface_RegisterEndpoint(intf, &ep_irq, USB_ENDPOINT_IN + 2));
+    STEP("EnableInterface", usbDsInterface_EnableInterface(intf));
+
+    STEP("AddLanguageString", usbDsAddUsbLanguageStringDescriptor(NULL, g_langs, 1));
+    STEP("AddString fab", usbDsAddUsbStringDescriptor(&iMan, "Nintendo"));
+    STEP("AddString prod", usbDsAddUsbStringDescriptor(&iProd, "Switch 2 (USBS2)"));
+    STEP("AddString serie", usbDsAddUsbStringDescriptor(&iSer, "USBS2-0001"));
+    dev_desc(&d, 0x0110, 0x40);
+    d.iManufacturer = iMan; d.iProduct = iProd; d.iSerialNumber = iSer;
+    STEP("SetDeviceDesc Full", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Full, &d));
+    d.bcdUSB = 0x0200;
+    STEP("SetDeviceDesc High", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_High, &d));
+    d.bcdUSB = 0x0300; d.bMaxPacketSize0 = 0x09;
+    STEP("SetDeviceDesc Super", usbDsSetUsbDeviceDescriptor(UsbDeviceSpeed_Super, &d));
+    STEP("SetBinaryObjectStore", usbDsSetBinaryObjectStore(g_bos, sizeof(g_bos)));
+    STEP("usbDsEnable", usbDsEnable());
+    out("  T7 COMPLETO: la consola deberia aparecer como dispositivo USB");
+    {
+        UsbState st = 0;
+        usbDsGetState(&st);
+        out("  estado USB ahora: %d (5 = configurado por el PC)", (int)st);
+    }
+done:
+    usbDsExit();
 }
 
 int main(int argc, char **argv) {
@@ -82,108 +143,13 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
 
     g_log = fopen("sdmc:/switch/usbprobe.log", "w");
-    out("usbprobe 1 - sonda usb:ds");
-    out("firmware (hosversion): %u.%u.%u", HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()));
-
-    // --- Prueba A: complex id 0..7, registrar interfaces 0..7 ---
-    out("");
-    out("== A: complex id x interfaz ==");
-    for (u32 cid = 0; cid < 8; cid++) {
-        Ds d;
-        Result rc = ds_open(&d);
-        if (R_FAILED(rc)) { out("cid %u: abrir usb:ds -> %s", cid, fmt_rc(rc)); continue; }
-        rc = ds_bind(&d, cid);
-        if (R_FAILED(rc)) { out("cid %u: bind -> %s", cid, fmt_rc(rc)); ds_close(&d); continue; }
-
-        char line[200];
-        int n = snprintf(line, sizeof(line), "cid %u: bind OK | reg:", cid);
-        for (u8 i = 0; i < 8; i++) {
-            Service s;
-            Result r = ds_register_u8(&d, i, &s);
-            if (R_SUCCEEDED(r)) { n += snprintf(line + n, sizeof(line) - n, " %u=OK", i); close_intf(&s); }
-            else n += snprintf(line + n, sizeof(line) - n, " %u=%X", i, r);
-        }
-        out("%s", line);
-        ds_close(&d);
-    }
-
-    // --- Prueba B: cid 2, interfaces 8..31 y entrada u32 ---
-    out("");
-    out("== B: cid 2, interfaces 8..31 ==");
-    {
-        Ds d;
-        Result rc = ds_open(&d);
-        if (R_SUCCEEDED(rc)) rc = ds_bind(&d, 2);
-        if (R_FAILED(rc)) out("abrir/bind -> %s", fmt_rc(rc));
-        else {
-            char line[300];
-            int n = 0;
-            for (u8 i = 8; i < 32; i++) {
-                Service s;
-                Result r = ds_register_u8(&d, i, &s);
-                if (R_SUCCEEDED(r)) { n += snprintf(line + n, sizeof(line) - n, " %u=OK", i); close_intf(&s); }
-                else n += snprintf(line + n, sizeof(line) - n, " %u=%X", i, r);
-                if (n > 200) { out("%s", line); n = 0; }
-            }
-            if (n) out("%s", line);
-            Service s;
-            Result r = ds_register_u32(&d, 0, &s);
-            out("reg(u32 0) -> %s", fmt_rc(r));
-            if (R_SUCCEEDED(r)) close_intf(&s);
-        }
-        ds_close(&d);
-    }
-
-    // --- Prueba C: qué comandos existen en IDsService (sin argumentos) ---
-    out("");
-    out("== C: comandos IDsService (sin args) ==");
-    {
-        Ds d;
-        Result rc = ds_open(&d);
-        if (R_SUCCEEDED(rc)) rc = ds_bind(&d, 2);
-        if (R_FAILED(rc)) out("abrir/bind -> %s", fmt_rc(rc));
-        else {
-            char line[300];
-            int n = 0;
-            for (u32 cmd = 0; cmd < 24; cmd++) {
-                if (cmd == 0 || cmd == 9) continue; // 0 = Bind, 9 = Enable: no se tocan
-                serviceAssumeDomain(&d.ds);
-                Result r = serviceDispatch(&d.ds, cmd);
-                n += snprintf(line + n, sizeof(line) - n, " c%u=%X", cmd, r);
-                if (n > 200) { out("%s", line); n = 0; }
-            }
-            if (n) out("%s", line);
-        }
-        ds_close(&d);
-    }
-
-    // --- Prueba D: comandos de la sesion raiz (IDsRootSession) ---
-    out("");
-    out("== D: comandos IDsRootSession ==");
-    {
-        Service root;
-        Result rc = smGetService(&root, "usb:ds");
-        if (R_SUCCEEDED(rc)) rc = serviceConvertToDomain(&root);
-        if (R_FAILED(rc)) out("abrir -> %s", fmt_rc(rc));
-        else {
-            char line[200];
-            int n = 0;
-            for (u32 cmd = 1; cmd < 8; cmd++) {
-                Service o;
-                serviceAssumeDomain(&root);
-                Result r = serviceDispatch(&root, cmd, .out_num_objects = 1, .out_objects = &o);
-                if (R_SUCCEEDED(r)) { serviceAssumeDomain(&o); serviceClose(&o); }
-                n += snprintf(line + n, sizeof(line) - n, " r%u=%X", cmd, r);
-            }
-            out("%s", line);
-            serviceClose(&root);
-        }
-    }
-
+    out("usbprobe 2 - orden de configuracion usb:ds");
+    for (int i = 0; i <= 6; i++) test_prefix(i);
+    test_register_first();
     out("");
     out("Listo. Log: sdmc:/switch/usbprobe.log");
     out("Pulsa + para salir.");
-    if (g_log) fclose(g_log);
+    if (g_log) { fclose(g_log); g_log = NULL; }
 
     while (appletMainLoop()) {
         padUpdate(&pad);
