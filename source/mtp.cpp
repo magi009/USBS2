@@ -231,6 +231,43 @@ static void touch_save(const Obj &o) {
     if (o.storage == STOR_SV) saves::commit(o.save);
 }
 
+// Borrado recursivo con las llamadas nativas del sistema de archivos. Registra cada
+// entrada que no se pueda borrar (con su nombre en hexadecimal) para poder ver qué pasa.
+static bool native_rm_dir(FsFileSystem *fs, const std::string &dir, int depth) {
+    FsDir d;
+    char path[FS_MAX_PATH] = {0};
+    snprintf(path, sizeof(path), "%s", dir.c_str());
+    Result rc = fsFsOpenDirectory(fs, path, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles | FsDirOpenMode_NoFileSize, &d);
+    if (R_FAILED(rc)) { log_write("mtp: borrar: OpenDirectory %s -> 0x%X", dir.c_str(), rc); return false; }
+    std::vector<FsDirectoryEntry> ents;
+    for (;;) {
+        FsDirectoryEntry e[16];
+        s64 n = 0;
+        if (R_FAILED(fsDirRead(&d, &n, 16, e)) || n <= 0) break;
+        ents.insert(ents.end(), e, e + n);
+    }
+    fsDirClose(&d);
+    if (depth == 0) log_write("mtp: borrar: %s tiene %u entradas", dir.c_str(), (unsigned)ents.size());
+    bool ok = true;
+    for (auto &e : ents) {
+        std::string child = dir + "/" + e.name;
+        snprintf(path, sizeof(path), "%s", child.c_str());
+        Result r;
+        if (e.type == FsDirEntryType_Dir) r = native_rm_dir(fs, child, depth + 1) ? 0 : 1;
+        else r = fsFsDeleteFile(fs, path);
+        if (R_FAILED(r)) {
+            ok = false;
+            char hex[3 * 48 + 1] = {0};
+            for (int k = 0; k < 48 && e.name[k]; k++) snprintf(hex + 3 * k, 4, "%02X ", (u8)e.name[k]);
+            log_write("mtp: borrar: no se pudo borrar '%s' (0x%X) nombre: %s", e.name, r, hex);
+        }
+    }
+    snprintf(path, sizeof(path), "%s", dir.c_str());
+    rc = fsFsDeleteDirectory(fs, path);
+    if (R_FAILED(rc)) { log_write("mtp: borrar: DeleteDirectory %s -> 0x%X", dir.c_str(), rc); return false; }
+    return ok;
+}
+
 // Borra un archivo o una carpeta con todo su contenido. Primero se leen todos los
 // nombres y después se borra: borrar mientras se lee la carpeta salta entradas en la
 // micro y la carpeta quedaba sin vaciar ("No tiene permiso para eliminar").
@@ -252,6 +289,7 @@ static bool rm_rf(const std::string &p) {
             Result rc = fsFsDeleteDirectoryRecursively(fs, fp);
             if (R_SUCCEEDED(rc)) return true;
             log_write("mtp: borrar: DeleteDirectoryRecursively %s -> 0x%X", p.c_str(), rc);
+            if (native_rm_dir(fs, rest, 0)) return true;
         } else {
             log_write("mtp: borrar: sin sistema de archivos para '%s'", dev.c_str());
         }
@@ -695,6 +733,13 @@ static struct { bool pending = false; u32 handle = 0; std::string path; u64 size
 static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name, u16 fmt, u64 size) {
     g_send.pending = false;
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
+    for (unsigned char ch : name)
+        if (ch >= 0x80) {
+            char hex[3 * 64 + 1] = {0};
+            for (size_t k = 0; k < name.size() && k < 64; k++) snprintf(hex + 3 * k, 4, "%02X ", (u8)name[k]);
+            log_write("mtp: nombre con acentos/simbolos: %s", hex);
+            break;
+        }
 
     Obj parent{st, -1, "", 0, true};
     if (parent_h != ROOT && parent_h != 0) {
