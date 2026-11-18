@@ -78,6 +78,9 @@ static constexpr u32 IO_TIMEOUT_MS = 30000;
 static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
 static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
 static u32 g_pending_len = 0;
+// En Switch 2 el USB rechaza los datos que llegan sin una lectura publicada, así
+// que la lectura de la fase de datos se publica en cuanto llega el comando.
+static bool g_preposted = false;
 
 static u64 now_ns() { return armTicksToNs(armGetSystemTick()); }
 
@@ -378,9 +381,16 @@ static bool send_data(const Cmd &c, const std::vector<u8> &payload) {
 static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
     u32 got = 0;
     usb::Status st;
-    do {
-        st = usb::read(g_buf, BUF_SIZE, &got, 0);
-    } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
+    if (g_preposted) {
+        g_preposted = false;
+        st = usb::end_read(&got, 0);
+        while (st == usb::Status::Ok && got == 0) st = usb::read(g_buf, BUF_SIZE, &got, 0); // ZLP sobrante
+    } else {
+        do {
+            st = usb::read(g_buf, BUF_SIZE, &got, 0);
+        } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
+    }
+    if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado por el PC antes de los datos"); return true; }
     if (st != usb::Status::Ok) return false;
     if (rd16(g_buf + 4) != CT_DATA && looks_like_command(g_buf, got)) {
         memcpy(g_pending_cmd, g_buf, got);
@@ -1020,13 +1030,22 @@ static void session_loop() {
             got = g_pending_len;
             memcpy(g_cmd, g_pending_cmd, got);
             g_pending_len = 0;
-        } else if (usb::read(g_cmd, 0x1000, &got) != usb::Status::Ok) {
-            return;
+        } else {
+            usb::clear_cancel();
+            usb::Status st = usb::read(g_cmd, 0x1000, &got);
+            if (st == usb::Status::Timeout) { usb::clear_cancel(); continue; } // cancelación sin operación en curso
+            if (st != usb::Status::Ok) return;
         }
         if (got == 0) continue;
         if (got < 12 || rd16(g_cmd + 4) != CT_COMMAND) continue;
         Cmd c{};
         c.code = rd16(g_cmd + 6);
+        // Operaciones con datos del PC: publicar ya la lectura (ver g_preposted).
+        if (g_session && (c.code == OP_SendObjectInfo || c.code == OP_SendObject || c.code == OP_SendObjectPropList ||
+                          c.code == OP_SetObjectPropValue)) {
+            if (!usb::begin_read(g_buf, BUF_SIZE)) return;
+            g_preposted = true;
+        }
         c.tid = rd32(g_cmd + 8);
         c.np = std::min<int>((int)(got - 12) / 4, 5);
         for (int i = 0; i < c.np; i++) c.p[i] = rd32(g_cmd + 12 + 4 * i);

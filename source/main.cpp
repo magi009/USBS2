@@ -21,7 +21,9 @@ static void step(const char *s) {
 
 int main(int, char **) {
     remove("sdmc:/USBS2.log");          // log viejo en la raíz (versiones anteriores)
-    remove("sdmc:/switch/USBS2.log");
+    // Se conserva el log de la sesión anterior (por si la app se cerró o se cayó).
+    remove("sdmc:/switch/USBS2-anterior.log");
+    rename("sdmc:/switch/USBS2.log", "sdmc:/switch/USBS2-anterior.log");
     consoleInit(nullptr);
     step("[1] consola iniciada");
 
@@ -37,7 +39,7 @@ int main(int, char **) {
     }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.5.2 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.6.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
@@ -67,7 +69,7 @@ int main(int, char **) {
         }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.5.2 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.6.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);

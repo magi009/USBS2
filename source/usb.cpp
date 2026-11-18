@@ -8,6 +8,7 @@ namespace usb {
 static UsbDsInterface *g_intf = nullptr;
 static UsbDsEndpoint *g_ep_in = nullptr, *g_ep_out = nullptr, *g_ep_irq = nullptr;
 static std::atomic<bool> *g_quit = nullptr;
+static std::atomic<bool> g_cancel_req{false}; // el PC mandó Cancel Request por el canal de control
 
 #define TRY(call) do { rc = (call); if (R_FAILED(rc)) log_write("    usb: %s -> 0x%X", #call, rc); else log_debug("    usb: %s -> 0x%X", #call, rc); if (R_FAILED(rc)) return rc; } while (0)
 
@@ -66,38 +67,44 @@ static Result intf_cmd_noio(u32 cmd) {
     return serviceDispatch(&g_intf->s, cmd);
 }
 
-// Contesta una petición de control. En Switch 2 los números de comando de
-// IDsInterface cambiaron; se anota cada intento antes de hacerlo.
+// Peticiones de control de la clase MTP (Still Image):
+//   21 64 = Cancel Request (el PC cancela la operación en curso; 6 bytes de datos)
+//   A1 67 = Get Device Status (el PC pregunta si el dispositivo está listo)
+// En Switch 2 la consola completa sola la fase de estado: solo se manda/recibe la
+// fase de datos (CtrlIn / CtrlOut), sin el paso extra que bloqueaba el canal.
+bool cancel_requested() { return g_cancel_req.load(); }
+void clear_cancel() { g_cancel_req = false; }
+
 static void handle_setup() {
     alignas(0x1000) static u8 pkt[0x1000];
     alignas(0x1000) static u8 data[0x1000];
     memset(pkt, 0, 8);
-    log_write("    usb: control: leyendo peticion (GetSetupPacket, cmd 2)...");
     Result rc = usbDsInterface_GetSetupPacket(g_intf, pkt, 8);
-    log_write("    usb: control: GetSetupPacket -> 0x%X | %02X %02X %02X %02X %02X %02X %02X %02X", rc, pkt[0], pkt[1],
-              pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7]);
-    if (R_FAILED(rc)) return;
+    log_debug("    usb: control: %02X %02X %02X %02X %02X %02X %02X %02X (0x%X)", pkt[0], pkt[1], pkt[2], pkt[3],
+              pkt[4], pkt[5], pkt[6], pkt[7], rc);
+    if (R_FAILED(rc)) { log_write("    usb: control: GetSetupPacket -> 0x%X", rc); return; }
 
     u8 type = pkt[0], req = pkt[1];
     u16 wLength = pkt[6] | (pkt[7] << 8);
-    if (type == 0xA1 && req == 0x67) {
-        // MTP "Get Device Status": respuesta = largo (4) + código OK (0x2001)
-        data[0] = 4; data[1] = 0; data[2] = 0x01; data[3] = 0x20;
-        u32 n = wLength < 4 ? wLength : 4;
-        u32 urb = 0;
-        log_write("    usb: control: GET_DEVICE_STATUS -> enviando OK (CtrlIn, cmd 3, %u bytes)...", n);
-        rc = usbDsInterface_CtrlInPostBufferAsync(g_intf, data, n, &urb);
-        log_write("    usb: control: CtrlIn -> 0x%X (urb %u)", rc, urb);
-        svcSleepThread(20'000'000ULL);
-        log_write("    usb: control: estado (CtrlOut 0 bytes, cmd 4)...");
-        rc = usbDsInterface_CtrlOutPostBufferAsync(g_intf, data, 0, &urb);
-        log_write("    usb: control: CtrlOut -> 0x%X (urb %u)", rc, urb);
+    u32 urb = 0;
+    if (type == 0x21 && req == 0x64) {
+        // Cancel Request: recibir sus datos (código 0x4001 + id de transacción)
+        g_cancel_req = true;
+        u32 n = wLength < 0x1000 ? wLength : 0x1000;
+        rc = usbDsInterface_CtrlOutPostBufferAsync(g_intf, data, n, &urb);
+        log_write("    usb: control: el PC CANCELO la operacion (CtrlOut %u -> 0x%X)", n, rc);
         return;
     }
-    // Cualquier otra petición: rechazar (STALL) para que el PC no espere.
-    log_write("    usb: control: peticion desconocida, rechazando (cmd 5)...");
-    rc = intf_cmd_noio(5);
-    log_write("    usb: control: rechazo cmd 5 -> 0x%X", rc);
+    if (type == 0xA1 && req == 0x67) {
+        // Get Device Status: largo (4) + OK (0x2001)
+        data[0] = 4; data[1] = 0; data[2] = 0x01; data[3] = 0x20;
+        u32 n = wLength < 4 ? wLength : 4;
+        rc = usbDsInterface_CtrlInPostBufferAsync(g_intf, data, n, &urb);
+        if (R_FAILED(rc)) log_write("    usb: control: GET_DEVICE_STATUS: CtrlIn -> 0x%X", rc);
+        else log_debug("    usb: control: GET_DEVICE_STATUS -> OK");
+        return;
+    }
+    log_write("    usb: control: peticion no manejada %02X %02X (largo %u)", type, req, wLength);
 }
 
 static void setup_watch(void *) {
@@ -107,7 +114,7 @@ static void setup_watch(void *) {
         if (R_FAILED(rc)) continue;
         eventClear(&g_intf->SetupEvent);
         u32 n = ++g_setup_count;
-        log_write("    usb: PETICION DE CONTROL #%u recibida (canal de control)", n);
+        log_debug("    usb: peticion de control #%u", n);
         handle_setup();
     }
 }
@@ -255,6 +262,7 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
             return Status::Error;
         }
         if (timeout_ms && waited_ms >= timeout_ms) { cancel(p); return Status::Timeout; }
+        if (g_cancel_req.load()) { cancel(p); return Status::Timeout; } // el PC canceló (Cancel Request)
     }
     eventClear(&p.ep->CompletionEvent);
     p.active = false;

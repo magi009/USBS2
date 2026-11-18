@@ -22,5 +22,7 @@ Status end_read(u32 *out, u32 timeout_ms = 0);
 bool begin_write(const void *buf, u32 size);
 Status end_write(u32 timeout_ms = 0);
 void cancel_all();
-u32 setup_count();   // peticiones recibidas por el canal de control (diagnóstico)
+u32 setup_count();
+bool cancel_requested();   // el PC canceló la operación en curso (Cancel Request)
+void clear_cancel();   // peticiones recibidas por el canal de control (diagnóstico)
 }
