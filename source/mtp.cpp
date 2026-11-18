@@ -35,14 +35,15 @@ enum : u16 {
     OP_GetDevicePropValue = 0x1015, OP_MoveObject = 0x1019, OP_GetPartialObject = 0x101B,
     OP_GetObjectPropsSupported = 0x9801, OP_GetObjectPropDesc = 0x9802,
     OP_GetObjectPropValue = 0x9803, OP_SetObjectPropValue = 0x9804,
-    OP_GetObjectReferences = 0x9810,
+    OP_GetObjectPropList = 0x9805, OP_GetObjectReferences = 0x9810,
 
     RC_OK = 0x2001, RC_GeneralError = 0x2002, RC_SessionNotOpen = 0x2003,
     RC_OperationNotSupported = 0x2005, RC_InvalidStorageID = 0x2008,
     RC_InvalidObjectHandle = 0x2009, RC_DevicePropNotSupported = 0x200A,
     RC_StoreFull = 0x200C, RC_AccessDenied = 0x200F, RC_NoValidObjectInfo = 0x2015,
     RC_InvalidParentObject = 0x201A, RC_SessionAlreadyOpen = 0x201E,
-    RC_InvalidObjectPropCode = 0xA801,
+    RC_InvalidObjectPropCode = 0xA801, RC_SpecificationByGroupUnsupported = 0xA807,
+    RC_SpecificationByDepthUnsupported = 0xA808,
 
     FMT_Undefined = 0x3000, FMT_Association = 0x3001,
 
@@ -62,11 +63,19 @@ static constexpr u32 BUF_SIZE = 4 * 1024 * 1024;
 // ---------------- estado ----------------
 static std::atomic<bool> *g_quit;
 static u8 *g_buf;   // datos (alineado 0x1000)
+static u8 *g_buf2;  // segundo buffer de datos: USB y micro trabajan a la vez
 static u8 *g_cmd;   // comandos y respuestas (alineado 0x1000)
 static Mutex g_status_mtx;
 static char g_status[128] = "Esperando cable USB...";
 static std::atomic<u64> g_bytes{0};
 static bool g_session = false;
+
+// Si el PC deja de mandar/recibir datos este tiempo, se da la transferencia
+// por cancelada (Windows al pulsar "Cancelar") y se vuelve a esperar comandos.
+static constexpr u32 IO_TIMEOUT_MS = 5000;
+static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
+static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
+static u32 g_pending_len = 0;
 
 void status(char *out, size_t size, u64 *bytes) {
     mutexLock(&g_status_mtx);
@@ -284,7 +293,21 @@ struct Cmd {
     int np;
 };
 
+static bool looks_like_command(const u8 *b, u32 got) {
+    return got >= 12 && got <= 32 && rd32(b) == got && rd16(b + 4) == CT_COMMAND;
+}
+
+// Escribe y traduce el estado: false solo si el USB murió; si el PC no lee
+// (canceló), marca g_aborted y devuelve true.
+static bool usb_write(const void *b, u32 n) {
+    if (g_aborted) return true;
+    usb::Status st = usb::write(b, n, IO_TIMEOUT_MS);
+    if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de leer (cancelado)"); return true; }
+    return st == usb::Status::Ok;
+}
+
 static bool send_response(u32 tid, u16 code, std::initializer_list<u32> params = {}) {
+    if (g_aborted) return true; // el PC abandonó esta operación: no se responde
     u32 len = 12 + 4 * (u32)params.size();
     u8 *b = g_cmd;
     memset(b, 0, len);
@@ -293,7 +316,7 @@ static bool send_response(u32 tid, u16 code, std::initializer_list<u32> params =
     memcpy(b + 8, &tid, 4);
     int i = 0;
     for (u32 x : params) memcpy(b + 12 + 4 * i++, &x, 4);
-    return usb::write(b, len);
+    return usb_write(b, len);
 }
 
 static void put_header(u8 *b, u64 total, u16 code, u32 tid) {
@@ -305,35 +328,75 @@ static void put_header(u8 *b, u64 total, u16 code, u32 tid) {
 }
 
 static bool send_zlp_if_needed(u64 total) {
-    if (total % usb::max_packet() == 0) return usb::write(g_buf, 0);
+    if (total % usb::max_packet() == 0) return usb_write(g_buf, 0);
     return true;
 }
 
 static bool send_data(const Cmd &c, const std::vector<u8> &payload) {
     u64 total = 12 + payload.size();
-    if (total > BUF_SIZE) return false;
     put_header(g_buf, total, c.code, c.tid);
-    if (!payload.empty()) memcpy(g_buf + 12, payload.data(), payload.size());
-    return usb::write(g_buf, (u32)total) && send_zlp_if_needed(total);
+    size_t off = 0;
+    u32 fill = 12;
+    for (;;) {
+        u32 n = (u32)std::min<size_t>(BUF_SIZE - fill, payload.size() - off);
+        if (n) memcpy(g_buf + fill, payload.data() + off, n);
+        off += n;
+        fill += n;
+        if (!usb_write(g_buf, fill)) return false;
+        if (g_aborted) return true;
+        if (off >= payload.size()) break;
+        fill = 0;
+    }
+    return send_zlp_if_needed(total);
 }
 
-// Recibe una fase de datos del PC. sink() recibe los trozos de carga útil.
+// Recibe una fase de datos del PC. sink() recibe los trozos de carga útil
+// mientras ya se está recibiendo el siguiente trozo por USB (doble buffer).
+// false = USB muerto. Si el PC cancela, g_aborted = true.
 static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
     u32 got = 0;
+    usb::Status st;
     do {
-        if (!usb::read(g_buf, BUF_SIZE, &got)) return false;
-    } while (got == 0); // ZLP sobrante de la transferencia anterior
-    if (got < 12) return false;
+        st = usb::read(g_buf, BUF_SIZE, &got, IO_TIMEOUT_MS);
+    } while (st == usb::Status::Ok && got == 0); // ZLP sobrante de la transferencia anterior
+    if (st == usb::Status::Error) return false;
+    if (st == usb::Status::Timeout || got < 12) { g_aborted = true; return true; }
+    if (rd16(g_buf + 4) != CT_DATA && looks_like_command(g_buf, got)) {
+        memcpy(g_pending_cmd, g_buf, got);
+        g_pending_len = got;
+        g_aborted = true;
+        return true;
+    }
     u32 len = rd32(g_buf);
     bool unknown = len == 0xFFFFFFFF;
     u64 recvd = got;
-    bool ok = sink(g_buf + 12, got - 12);
-    while (unknown ? got == BUF_SIZE : recvd < len) {
-        if (!usb::read(g_buf, BUF_SIZE, &got)) return false;
-        if (got == 0) break;
-        recvd += got;
-        if (ok) ok = sink(g_buf, got);
-        g_bytes += got;
+    u8 *cur = g_buf;
+    u32 cur_n = got, cur_off = 12;
+    bool more = unknown ? got == BUF_SIZE : recvd < len;
+    bool ok = true;
+    for (;;) {
+        u8 *nxt = cur == g_buf ? g_buf2 : g_buf;
+        if (more && !usb::begin_read(nxt, BUF_SIZE)) return false;
+        if (ok) ok = sink(cur + cur_off, cur_n - cur_off);
+        g_bytes += cur_n - cur_off;
+        if (!more) break;
+        u32 n = 0;
+        st = usb::end_read(&n, IO_TIMEOUT_MS);
+        if (st == usb::Status::Error) return false;
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de enviar (cancelado)"); return true; }
+        if (n == 0) break;
+        if (looks_like_command(nxt, n) && (unknown || len - recvd != n)) {
+            memcpy(g_pending_cmd, nxt, n);
+            g_pending_len = n;
+            g_aborted = true;
+            log_write("mtp: llego un comando a mitad de la copia (cancelado)");
+            return true;
+        }
+        recvd += n;
+        cur = nxt;
+        cur_n = n;
+        cur_off = 0;
+        more = unknown ? n == BUF_SIZE : recvd < len;
     }
     return true;
 }
@@ -350,7 +413,7 @@ static bool op_device_info(const Cmd &c) {
            OP_GetObjectHandles, OP_GetObjectInfo, OP_GetObject, OP_DeleteObject, OP_SendObjectInfo,
            OP_SendObject, OP_GetDevicePropDesc, OP_GetDevicePropValue, OP_MoveObject, OP_GetPartialObject,
            OP_GetObjectPropsSupported, OP_GetObjectPropDesc, OP_GetObjectPropValue, OP_SetObjectPropValue,
-           OP_GetObjectReferences});
+           OP_GetObjectReferences, OP_GetObjectPropList});
     w.a16({});
     w.a16({DPROP_FriendlyName});
     w.a16({});
@@ -462,29 +525,40 @@ static bool op_object_info(const Cmd &c) {
 static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 len) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return send_response(c.tid, RC_AccessDenied);
+    static char *vbuf = (char *)malloc(1 << 20);
+    if (vbuf) setvbuf(f, vbuf, _IOFBF, 1 << 20);
     if (offset) fseeko(f, (off_t)offset, SEEK_SET);
     u64 total = 12 + len;
-    put_header(g_buf, total, c.code, c.tid);
-    u32 fill = 12;
     u64 left = len;
-    bool ok = true;
-    set_status("Enviando %s", path.c_str());
-    for (;;) {
-        u32 want = (u32)std::min<u64>(BUF_SIZE - fill, left);
-        size_t n = want ? fread(g_buf + fill, 1, want, f) : 0;
-        if (n < want) memset(g_buf + fill + n, 0, want - n); // archivo truncado: rellena para no romper el protocolo
-        fill += want;
+    auto fill = [&](u8 *b, u32 start) -> u32 {
+        u32 want = (u32)std::min<u64>(BUF_SIZE - start, left);
+        size_t n = want ? fread(b + start, 1, want, f) : 0;
+        if (n < want) memset(b + start + n, 0, want - n); // archivo truncado: rellena para no romper el protocolo
         left -= want;
-        if (fill == 0) break;
-        if (!usb::write(g_buf, fill)) { ok = false; break; }
-        g_bytes += fill;
-        if (left == 0) break;
-        fill = 0;
+        return start + want;
+    };
+    set_status("Enviando %s", path.c_str());
+    put_header(g_buf, total, c.code, c.tid);
+    u8 *cur = g_buf;
+    u32 n = fill(cur, 12);
+    bool dead = false;
+    for (;;) {
+        if (!usb::begin_write(cur, n)) { dead = true; break; }
+        u8 *nxt = cur == g_buf ? g_buf2 : g_buf;
+        u32 nn = left ? fill(nxt, 0) : 0; // lee de la micro mientras el USB envía
+        usb::Status st = usb::end_write(IO_TIMEOUT_MS);
+        if (st == usb::Status::Error) { dead = true; break; }
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: el PC dejo de leer (cancelado)"); break; }
+        g_bytes += n;
+        if (nn == 0) break;
+        cur = nxt;
+        n = nn;
     }
     fclose(f);
-    if (!ok) return false;
-    if (!send_zlp_if_needed(total)) return false;
     set_status("Conectado al PC");
+    if (dead) return false;
+    if (g_aborted) return true;
+    if (!send_zlp_if_needed(total)) return false;
     if (c.code == OP_GetPartialObject) return send_response(c.tid, RC_OK, {(u32)len});
     return send_response(c.tid, RC_OK);
 }
@@ -579,9 +653,14 @@ static bool op_send_object(const Cmd &c) {
     });
     if (f) fclose(f);
     Obj *o = get_obj(g_send.handle);
+    if (g_aborted) {
+        unlink(g_send.path.c_str()); // copia cancelada: no dejar el archivo a medias
+        if (o) o->alive = false;
+        log_write("mtp: copia cancelada, borrado %s", g_send.path.c_str());
+    }
     if (o) touch_save(*o);
-    if (!ok) return false;
     set_status("Conectado al PC");
+    if (!ok) return false;
     return send_response(c.tid, werr ? RC_StoreFull : RC_OK);
 }
 
@@ -650,16 +729,17 @@ static bool op_prop_desc(const Cmd &c) {
     return send_data(c, w.v) && send_response(c.tid, RC_OK);
 }
 
-static bool op_prop_value(const Cmd &c) {
-    u32 h = c.p[0];
-    Obj *op = get_obj(h);
-    if (!op) return send_response(c.tid, RC_InvalidObjectHandle);
-    Obj o = *op;
-    u16 prop = (u16)c.p[1];
-    if (!known_prop(prop)) return send_response(c.tid, RC_InvalidObjectPropCode);
-    bool dir; u64 size; time_t mt;
-    if (!obj_stat(o, dir, size, mt)) return send_response(c.tid, RC_InvalidObjectHandle);
-    W w;
+static u16 prop_type(u16 prop) {
+    switch (prop) {
+    case PROP_StorageID: case PROP_ParentObject: return DT_UINT32;
+    case PROP_ObjectFormat: case PROP_ProtectionStatus: return DT_UINT16;
+    case PROP_ObjectSize: return DT_UINT64;
+    case PROP_PersistentUID: return DT_UINT128;
+    default: return DT_STR;
+    }
+}
+
+static void put_prop_value(W &w, u32 h, const Obj &o, u16 prop, bool dir, u64 size, time_t mt) {
     switch (prop) {
     case PROP_StorageID: w.u32_(o.storage); break;
     case PROP_ObjectFormat: w.u16_(dir ? FMT_Association : FMT_Undefined); break;
@@ -670,6 +750,69 @@ static bool op_prop_value(const Cmd &c) {
     case PROP_ParentObject: w.u32_(o.parent); break;
     case PROP_PersistentUID: w.u64_(h); w.u64_(o.storage); break;
     }
+}
+
+static const u16 ALL_PROPS[] = {PROP_StorageID, PROP_ObjectFormat, PROP_ProtectionStatus, PROP_ObjectSize,
+                                PROP_ObjectFileName, PROP_DateModified, PROP_ParentObject, PROP_PersistentUID, PROP_Name};
+
+static bool op_prop_value(const Cmd &c) {
+    u32 h = c.p[0];
+    Obj *op = get_obj(h);
+    if (!op) return send_response(c.tid, RC_InvalidObjectHandle);
+    Obj o = *op;
+    u16 prop = (u16)c.p[1];
+    if (!known_prop(prop)) return send_response(c.tid, RC_InvalidObjectPropCode);
+    bool dir; u64 size; time_t mt;
+    if (!obj_stat(o, dir, size, mt)) return send_response(c.tid, RC_InvalidObjectHandle);
+    W w;
+    put_prop_value(w, h, o, prop, dir, size, mt);
+    return send_data(c, w.v) && send_response(c.tid, RC_OK);
+}
+
+// GetObjectPropList: todas las propiedades de un objeto (profundidad 0) o de
+// todos los hijos de una carpeta (profundidad 1) en una sola respuesta. Windows
+// lo usa si está disponible y así no pregunta propiedad por propiedad.
+static bool op_prop_list(const Cmd &c) {
+    u32 h = c.p[0], prop = c.np > 2 ? c.p[2] : 0xFFFFFFFF, group = c.np > 3 ? c.p[3] : 0, depth = c.np > 4 ? c.p[4] : 0;
+    if (prop == 0 && group != 0) return send_response(c.tid, RC_SpecificationByGroupUnsupported);
+    if (prop != 0 && prop != 0xFFFFFFFF && !known_prop((u16)prop)) return send_response(c.tid, RC_InvalidObjectPropCode);
+
+    std::vector<u32> hs;
+    if (depth == 0) {
+        if (h == 0 || h == ROOT) return send_response(c.tid, RC_SpecificationByDepthUnsupported);
+        if (!get_obj(h)) return send_response(c.tid, RC_InvalidObjectHandle);
+        hs.push_back(h);
+    } else if (depth == 1) {
+        if (h == 0 || h == ROOT) {
+            for (u32 st : {STOR_SD, STOR_HB, STOR_SV}) list_children(st, ROOT, hs);
+        } else {
+            Obj *po = get_obj(h);
+            if (!po) return send_response(c.tid, RC_InvalidObjectHandle);
+            list_children(po->storage, h, hs);
+        }
+    } else {
+        return send_response(c.tid, RC_SpecificationByDepthUnsupported);
+    }
+
+    W w;
+    w.u32_(0); // número de elementos, se rellena al final
+    u32 count = 0;
+    for (u32 oh : hs) {
+        Obj *op = get_obj(oh);
+        if (!op) continue;
+        Obj o = *op;
+        bool dir; u64 size; time_t mt;
+        if (!obj_stat(o, dir, size, mt)) continue;
+        for (u16 pc : ALL_PROPS) {
+            if (prop != 0 && prop != 0xFFFFFFFF && pc != prop) continue;
+            w.u32_(oh);
+            w.u16_(pc);
+            w.u16_(prop_type(pc));
+            put_prop_value(w, oh, o, pc, dir, size, mt);
+            count++;
+        }
+    }
+    memcpy(w.v.data(), &count, 4);
     return send_data(c, w.v) && send_response(c.tid, RC_OK);
 }
 
@@ -718,12 +861,14 @@ static bool op_refs(const Cmd &c) {
 }
 
 static bool dispatch(const Cmd &c) {
+    g_aborted = false;
     if (c.code != OP_GetObjectPropValue && c.code != OP_GetObjectInfo)
         log_debug("mtp: op 0x%04X tid %u p0 0x%X", c.code, c.tid, c.np ? c.p[0] : 0);
     if (c.code == OP_GetDeviceInfo) return op_device_info(c);
     if (c.code == OP_OpenSession) {
-        if (g_session) return send_response(c.tid, RC_SessionAlreadyOpen);
+        // Si el PC reabre la sesión (p. ej. tras cancelar), se reinicia sin error.
         g_session = true;
+        g_send.pending = false;
         reset_objects();
         saves::scan();
         set_status("Conectado al PC (%d partidas)", saves::count());
@@ -751,6 +896,7 @@ static bool dispatch(const Cmd &c) {
     case OP_SetObjectPropValue: return op_set_prop_value(c);
     case OP_GetDevicePropDesc: case OP_GetDevicePropValue: return op_dev_prop(c);
     case OP_GetObjectReferences: return op_refs(c);
+    case OP_GetObjectPropList: return op_prop_list(c);
     default: return send_response(c.tid, RC_OperationNotSupported);
     }
 }
@@ -758,7 +904,13 @@ static bool dispatch(const Cmd &c) {
 static void session_loop() {
     while (!g_quit->load()) {
         u32 got = 0;
-        if (!usb::read(g_cmd, 0x1000, &got)) return;
+        if (g_pending_len) {
+            got = g_pending_len;
+            memcpy(g_cmd, g_pending_cmd, got);
+            g_pending_len = 0;
+        } else if (usb::read(g_cmd, 0x1000, &got) != usb::Status::Ok) {
+            return;
+        }
         if (got == 0) continue;
         if (got < 12 || rd16(g_cmd + 4) != CT_COMMAND) continue;
         Cmd c{};
@@ -791,8 +943,9 @@ Result start(std::atomic<bool> *quit) {
     g_quit = quit;
     mutexInit(&g_status_mtx);
     g_buf = (u8 *)memalign(0x1000, BUF_SIZE);
+    g_buf2 = (u8 *)memalign(0x1000, BUF_SIZE);
     g_cmd = (u8 *)memalign(0x1000, 0x1000);
-    if (!g_buf || !g_cmd) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (!g_buf || !g_buf2 || !g_cmd) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     mkdir("sdmc:/switch", 0777);
     Result rc = usb::init(quit);
     if (R_FAILED(rc)) { usb::exit(); return rc; }
@@ -806,6 +959,7 @@ void stop() {
     threadClose(&g_thread);
     usb::exit();
     free(g_buf);
+    free(g_buf2);
     free(g_cmd);
 }
 

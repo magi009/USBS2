@@ -123,72 +123,103 @@ Result init(std::atomic<bool> *quit_flag) {
 
 void exit() { usbDsExit(); }
 
+static void update_max_packet();
+
 bool wait_ready() {
     Result last = 0;
     while (!g_quit->load()) {
         Result rc = usbDsWaitReady(100'000'000ULL);
-        if (R_SUCCEEDED(rc)) return true;
+        if (R_SUCCEEDED(rc)) { update_max_packet(); return true; }
         if (rc != last) { log_debug("    usb: usbDsWaitReady -> 0x%X", rc); last = rc; }
     }
     return false;
 }
 
-u32 max_packet() {
+static u32 g_mps = 0x200;
+
+u32 max_packet() { return g_mps; }
+
+static void update_max_packet() {
     UsbDeviceSpeed sp = UsbDeviceSpeed_None;
     Result rc = usbDsGetSpeed(&sp);
-    static bool logged = false;
-    if (!logged) { log_write("    usb: usbDsGetSpeed -> 0x%X (vel %d)", rc, (int)sp); logged = true; }
+    g_mps = 0x200;
     if (R_SUCCEEDED(rc)) {
-        if (sp == UsbDeviceSpeed_Super) return 0x400;
-        if (sp == UsbDeviceSpeed_Full) return 0x40;
+        if (sp == UsbDeviceSpeed_Super) g_mps = 0x400;
+        else if (sp == UsbDeviceSpeed_Full) g_mps = 0x40;
     }
-    return 0x200;
+    log_write("    usb: velocidad %d (paquete max %u)", (int)sp, g_mps);
 }
 
-static bool xfer(UsbDsEndpoint *ep, void *buf, u32 size, u32 *out) {
-    u32 urb = 0;
-    Result prc = usbDsEndpoint_PostBufferAsync(ep, buf, size, &urb);
-    if (R_FAILED(prc)) { log_write("    usb: PostBufferAsync(%u) -> 0x%X", size, prc); return false; }
+// Una transferencia en curso por endpoint (como mucho).
+struct Pending { UsbDsEndpoint *ep; void *buf; u32 size; u32 urb; bool active; bool is_read; };
+static Pending g_rd = {}, g_wr = {};
+
+static bool begin(Pending &p, UsbDsEndpoint *ep, void *buf, u32 size, bool is_read) {
+    if (!is_read) armDCacheFlush(buf, size);
+    p = {ep, buf, size, 0, false, is_read};
+    Result rc = usbDsEndpoint_PostBufferAsync(ep, buf, size, &p.urb);
+    if (R_FAILED(rc)) { log_write("    usb: PostBufferAsync(%u) -> 0x%X", size, rc); return false; }
+    p.active = true;
+    return true;
+}
+
+static void cancel(Pending &p) {
+    if (!p.active) return;
+    usbDsEndpoint_Cancel(p.ep);
+    eventWait(&p.ep->CompletionEvent, 1'000'000'000ULL);
+    eventClear(&p.ep->CompletionEvent);
+    p.active = false;
+}
+
+static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
+    if (!p.active) return Status::Error;
+    u64 waited_ms = 0;
     for (;;) {
-        Result rc = eventWait(&ep->CompletionEvent, 100'000'000ULL);
+        Result rc = eventWait(&p.ep->CompletionEvent, 100'000'000ULL);
         if (R_SUCCEEDED(rc)) break;
-        if (g_quit->load()) {
-            usbDsEndpoint_Cancel(ep);
-            eventWait(&ep->CompletionEvent, 1'000'000'000ULL);
-            eventClear(&ep->CompletionEvent);
-            return false;
-        }
+        waited_ms += 100;
+        if (g_quit->load()) { cancel(p); return Status::Error; }
         UsbState st;
-        Result src = usbDsGetState(&st);
-        if (R_FAILED(src) || st != UsbState_Configured) log_write("    usb: GetState -> 0x%X (estado %d)", src, (int)st);
-        if (R_SUCCEEDED(src) && st != UsbState_Configured) { // cable desconectado
-            usbDsEndpoint_Cancel(ep);
-            eventWait(&ep->CompletionEvent, 1'000'000'000ULL);
-            eventClear(&ep->CompletionEvent);
-            return false;
+        if (R_SUCCEEDED(usbDsGetState(&st)) && st != UsbState_Configured) {
+            log_write("    usb: cable desconectado (estado %d)", (int)st);
+            cancel(p);
+            return Status::Error;
         }
+        if (timeout_ms && waited_ms >= timeout_ms) { cancel(p); return Status::Timeout; }
     }
-    eventClear(&ep->CompletionEvent);
+    eventClear(&p.ep->CompletionEvent);
+    p.active = false;
     UsbDsReportData report;
-    Result grc = usbDsEndpoint_GetReportData(ep, &report);
-    if (R_FAILED(grc)) { log_write("    usb: GetReportData -> 0x%X", grc); return false; }
+    Result grc = usbDsEndpoint_GetReportData(p.ep, &report);
+    if (R_FAILED(grc)) { log_write("    usb: GetReportData -> 0x%X", grc); return Status::Error; }
     u32 done = 0;
-    Result parc = usbDsParseReportData(&report, urb, nullptr, &done);
-    if (R_FAILED(parc)) { log_write("    usb: ParseReportData -> 0x%X", parc); return false; }
+    Result parc = usbDsParseReportData(&report, p.urb, nullptr, &done);
+    if (R_FAILED(parc)) { log_write("    usb: ParseReportData -> 0x%X", parc); return Status::Error; }
+    if (p.is_read) armDCacheFlush(p.buf, done);
     if (out) *out = done;
-    return true;
+    return Status::Ok;
 }
 
-bool read(void *buf, u32 size, u32 *out) {
-    if (!xfer(g_ep_out, buf, size, out)) return false;
-    armDCacheFlush(buf, *out);
-    return true;
+bool begin_read(void *buf, u32 size) { return begin(g_rd, g_ep_out, buf, size, true); }
+Status end_read(u32 *out, u32 timeout_ms) { return finish(g_rd, out, timeout_ms); }
+bool begin_write(const void *buf, u32 size) { return begin(g_wr, g_ep_in, const_cast<void *>(buf), size, false); }
+Status end_write(u32 timeout_ms) {
+    u32 size = g_wr.size, done = 0;
+    Status s = finish(g_wr, &done, timeout_ms);
+    if (s == Status::Ok && done != size) return Status::Error;
+    return s;
 }
 
-bool write(const void *buf, u32 size) {
-    armDCacheFlush(const_cast<void *>(buf), size);
-    u32 done = 0;
-    return xfer(g_ep_in, const_cast<void *>(buf), size, &done) && done == size;
+Status read(void *buf, u32 size, u32 *out, u32 timeout_ms) {
+    if (!begin_read(buf, size)) return Status::Error;
+    return end_read(out, timeout_ms);
 }
+
+Status write(const void *buf, u32 size, u32 timeout_ms) {
+    if (!begin_write(buf, size)) return Status::Error;
+    return end_write(timeout_ms);
+}
+
+void cancel_all() { cancel(g_rd); cancel(g_wr); }
 
 } // namespace usb
