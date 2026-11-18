@@ -9,10 +9,10 @@ static UsbDsInterface *g_intf = nullptr;
 static UsbDsEndpoint *g_ep_in = nullptr, *g_ep_out = nullptr, *g_ep_irq = nullptr;
 static std::atomic<bool> *g_quit = nullptr;
 
-#define TRY(call) do { rc = (call); log_write("    usb: %s -> 0x%X", #call, rc); if (R_FAILED(rc)) return rc; } while (0)
+#define TRY(call) do { rc = (call); if (R_FAILED(rc)) log_write("    usb: %s -> 0x%X", #call, rc); else log_debug("    usb: %s -> 0x%X", #call, rc); if (R_FAILED(rc)) return rc; } while (0)
 
 static Result log_rc(const char *what, Result rc) {
-    log_write("    usb: %s -> 0x%X", what, rc);
+    if (R_FAILED(rc)) log_write("    usb: %s -> 0x%X", what, rc); else log_debug("    usb: %s -> 0x%X", what, rc);
     return rc;
 }
 
@@ -128,7 +128,7 @@ bool wait_ready() {
     while (!g_quit->load()) {
         Result rc = usbDsWaitReady(100'000'000ULL);
         if (R_SUCCEEDED(rc)) return true;
-        if (rc != last) { log_write("    usb: usbDsWaitReady -> 0x%X", rc); last = rc; }
+        if (rc != last) { log_debug("    usb: usbDsWaitReady -> 0x%X", rc); last = rc; }
     }
     return false;
 }

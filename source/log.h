@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+// Registro detallado (cada operación MTP y cada paso USB). Se activa manteniendo
+// ZL al abrir la app; si no, solo se registran el arranque y los errores.
+inline bool g_log_verbose = false;
+
 inline Mutex &log_mutex() { static Mutex m = {}; return m; }
 inline std::vector<std::string> &log_lines() { static std::vector<std::string> v; return v; }
 
@@ -30,6 +34,8 @@ inline void log_write(const char *fmt, ...) {
     }
     mutexUnlock(&log_mutex());
 }
+
+#define log_debug(...) do { if (g_log_verbose) log_write(__VA_ARGS__); } while (0)
 
 // Copia las últimas n líneas (para pintarlas en pantalla).
 inline std::vector<std::string> log_tail(size_t n) {

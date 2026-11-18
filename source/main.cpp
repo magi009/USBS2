@@ -21,7 +21,6 @@ static void step(const char *s) {
 int main(int, char **) {
     remove("sdmc:/USBS2.log");
     remove("sdmc:/switch/USBS2.log");
-    log_write("[0] main() alcanzado, antes de la consola");
     consoleInit(nullptr);
     step("[1] consola iniciada");
 
@@ -29,17 +28,12 @@ int main(int, char **) {
     PadState pad;
     padInitializeDefault(&pad);
     padUpdate(&pad);
-    bool safe = padGetButtons(&pad) & HidNpadButton_R;
-    log_write("    modo seguro: %s", safe ? "si" : "no");
-    log_write("    firmware: %u.%u.%u", HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()));
-    log_write("    applet type: %d", (int)appletGetAppletType());
-    for (const char *p : {"sdmc:/USBS2.log", "sdmc:/switch/USBS2.log"}) {
-        FILE *f = fopen(p, "a");
-        log_write("    escribir %s: %s (errno %d)", p, f ? "OK" : "FALLA", f ? 0 : errno);
-        if (f) fclose(f);
-    }
-
-    // [2] Sin llamadas al applet manager (am): el error 2128 apunta a ese servicio.
+    u64 held = padGetButtons(&pad);
+    bool safe = held & HidNpadButton_R;
+    g_log_verbose = held & HidNpadButton_ZL;
+    log_write("USBS2 1.2.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+              HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
+              safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
     static std::atomic<bool> quit{false};
     if (!safe) {
@@ -53,7 +47,6 @@ int main(int, char **) {
     Result rc = mtp::start(&quit);
     log_write("    resultado USB: 0x%X", rc);
     step("[5] listo");
-    svcSleepThread(1'000'000'000ULL);
     consoleClear();
 
     char line[128];
@@ -64,7 +57,7 @@ int main(int, char **) {
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
 
         printf("\x1b[1;1H");
-        printf("USBS2 - Transferencia USB (MTP)%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "");
+        printf("USBS2 1.2.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);

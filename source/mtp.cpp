@@ -719,7 +719,7 @@ static bool op_refs(const Cmd &c) {
 
 static bool dispatch(const Cmd &c) {
     if (c.code != OP_GetObjectPropValue && c.code != OP_GetObjectInfo)
-        log_write("mtp: op 0x%04X tid %u p0 0x%X", c.code, c.tid, c.np ? c.p[0] : 0);
+        log_debug("mtp: op 0x%04X tid %u p0 0x%X", c.code, c.tid, c.np ? c.p[0] : 0);
     if (c.code == OP_GetDeviceInfo) return op_device_info(c);
     if (c.code == OP_OpenSession) {
         if (g_session) return send_response(c.tid, RC_SessionAlreadyOpen);
