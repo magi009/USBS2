@@ -22,6 +22,12 @@ Status end_read(u32 *out, u32 timeout_ms = 0);
 bool begin_write(const void *buf, u32 size);
 Status end_write(u32 timeout_ms = 0);
 void cancel_all();
+
+// Cola de lecturas PC -> consola: varias lecturas publicadas a la vez.
+bool rx_start(void *const *bufs, int n, u32 size);
+Status rx_wait(int *idx, u32 *got, u32 timeout_ms = 0);
+bool rx_repost(int idx);
+void rx_stop();
 u32 setup_count();
 bool cancel_requested();   // el PC canceló la operación en curso (Cancel Request)
 void clear_cancel();   // peticiones recibidas por el canal de control (diagnóstico)

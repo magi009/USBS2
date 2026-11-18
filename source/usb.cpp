@@ -283,6 +283,94 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
     return Status::Ok;
 }
 
+// ---- Cola de lecturas PC -> consola (varias URB publicadas a la vez) ----
+// En Switch 2 los datos que llegan sin una lectura publicada hacen que el PC
+// cancele; con varias lecturas en cola nunca hay un hueco.
+static constexpr int RXQ_MAX = 4;
+static struct {
+    void *buf[RXQ_MAX];
+    u32 urb[RXQ_MAX];
+    bool posted[RXQ_MAX];
+    int n = 0;
+    u32 size = 0;
+    int head = 0;      // la próxima en completarse (orden de publicación)
+} g_rxq;
+
+bool rx_repost(int i) {
+    if (i < 0 || i >= g_rxq.n || g_rxq.posted[i]) return true;
+    armDCacheFlush(g_rxq.buf[i], g_rxq.size);
+    Result rc = usbDsEndpoint_PostBufferAsync(g_ep_out, g_rxq.buf[i], g_rxq.size, &g_rxq.urb[i]);
+    if (R_FAILED(rc)) { log_write("    usb: rx PostBufferAsync -> 0x%X", rc); return false; }
+    g_rxq.posted[i] = true;
+    return true;
+}
+
+bool rx_start(void *const *bufs, int n, u32 size) {
+    g_rxq.n = n > RXQ_MAX ? RXQ_MAX : n;
+    g_rxq.size = size;
+    g_rxq.head = 0;
+    for (int i = 0; i < g_rxq.n; i++) { g_rxq.buf[i] = bufs[i]; g_rxq.posted[i] = false; }
+    for (int i = 0; i < g_rxq.n; i++)
+        if (!rx_repost(i)) return false;
+    return true;
+}
+
+void rx_stop() {
+    bool any = false;
+    for (int i = 0; i < g_rxq.n; i++) any |= g_rxq.posted[i];
+    if (any) {
+        usbDsEndpoint_Cancel(g_ep_out);
+        eventWait(&g_ep_out->CompletionEvent, 1'000'000'000ULL);
+        eventClear(&g_ep_out->CompletionEvent);
+    }
+    for (int i = 0; i < g_rxq.n; i++) g_rxq.posted[i] = false;
+    g_rxq.head = 0;
+}
+
+// Espera a que se complete la lectura más antigua de la cola. Devuelve su índice;
+// el buffer queda en manos del que llama hasta que haga rx_repost(índice).
+Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
+    int i = g_rxq.head;
+    if (g_rxq.n == 0 || !g_rxq.posted[i]) return Status::Error;
+    u64 waited_ms = 0;
+    for (;;) {
+        UsbDsReportData report;
+        if (R_SUCCEEDED(usbDsEndpoint_GetReportData(g_ep_out, &report))) {
+            u32 done = 0;
+            Result prc = usbDsParseReportData(&report, g_rxq.urb[i], nullptr, &done);
+            if (R_SUCCEEDED(prc)) {
+                g_rxq.posted[i] = false;
+                g_rxq.head = (i + 1) % g_rxq.n;
+                armDCacheFlush(g_rxq.buf[i], done);
+                if (g_log_verbose) {
+                    const u8 *b = (const u8 *)g_rxq.buf[i];
+                    char hex[3 * 16 + 1] = {0};
+                    for (u32 k = 0; k < done && k < 16; k++) snprintf(hex + 3 * k, 4, "%02X ", b[k]);
+                    log_write("    usb LEE %u (cola %d, urb %u): %s", done, i, g_rxq.urb[i], hex);
+                }
+                *idx = i;
+                *got = done;
+                return Status::Ok;
+            }
+            if (prc == 0x828C || prc == 0x748C) {
+                log_write("    usb: rx urb %u -> 0x%X", g_rxq.urb[i], prc);
+                return Status::Error;
+            }
+        }
+        Result rc = eventWait(&g_ep_out->CompletionEvent, 100'000'000ULL);
+        if (R_SUCCEEDED(rc)) { eventClear(&g_ep_out->CompletionEvent); continue; }
+        waited_ms += 100;
+        if (g_quit->load()) return Status::Error;
+        UsbState st;
+        if (R_SUCCEEDED(usbDsGetState(&st)) && st != UsbState_Configured) {
+            log_write("    usb: cable desconectado (estado %d)", (int)st);
+            return Status::Error;
+        }
+        if (timeout_ms && waited_ms >= timeout_ms) return Status::Timeout;
+        if (g_cancel_req.load()) return Status::Timeout; // el PC canceló (Cancel Request)
+    }
+}
+
 bool begin_read(void *buf, u32 size) { return begin(g_rd, g_ep_out, buf, size, true); }
 Status end_read(u32 *out, u32 timeout_ms) { return finish(g_rd, out, timeout_ms); }
 bool begin_write(const void *buf, u32 size) { return begin(g_wr, g_ep_in, const_cast<void *>(buf), size, false); }
@@ -303,6 +391,6 @@ Status write(const void *buf, u32 size, u32 timeout_ms) {
     return end_write(timeout_ms);
 }
 
-void cancel_all() { cancel(g_rd); cancel(g_wr); }
+void cancel_all() { cancel(g_rd); cancel(g_wr); rx_stop(); }
 
 } // namespace usb

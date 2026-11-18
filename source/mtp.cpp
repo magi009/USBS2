@@ -78,32 +78,36 @@ static constexpr u32 IO_TIMEOUT_MS = 30000;
 static bool g_aborted = false;          // la operación en curso fue cancelada por el PC
 static u8 g_pending_cmd[32];            // comando que llegó en mitad de una fase de datos
 static u32 g_pending_len = 0;
-// Canal PC -> consola: SIEMPRE hay una lectura publicada. En cuanto se completa
-// una, se publica la siguiente en el otro buffer antes de procesar nada. Así no
-// queda ni un instante en que el PC mande datos sin nadie escuchando (en Switch 2
-// eso parece hacer que Windows cancele la copia en el mismo milisegundo).
+// Canal PC -> consola: SIEMPRE hay varias lecturas publicadas (cola de 3). Mientras
+// se procesa un bloque, las otras siguen recibiendo: nunca hay un instante en que
+// el PC mande datos sin nadie escuchando (en Switch 2 eso hace que Windows cancele).
 static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
-static u8 *g_rx[2];
-static int g_rx_i = 0;          // buffer de la lectura publicada
-static bool g_rx_posted = false;
+static constexpr int RX_N = 3;
+static u8 *g_rx[RX_N];
+static bool g_rx_running = false;
+static int g_rx_held = -1;     // buffer que se está procesando (se vuelve a publicar en rx_next)
 
-static bool rx_post() {
-    if (g_rx_posted) return true;
-    if (!usb::begin_read(g_rx[g_rx_i], RX_SIZE)) return false;
-    g_rx_posted = true;
-    return true;
+static void rx_reset() {
+    usb::rx_stop();
+    g_rx_running = false;
+    g_rx_held = -1;
 }
 
-// Espera la lectura publicada, publica ya la siguiente y devuelve el buffer
-// recibido (válido hasta la siguiente llamada a rx_next).
+// Devuelve el siguiente bloque recibido (válido hasta la siguiente llamada).
 static usb::Status rx_next(u8 **buf, u32 *got, u32 timeout_ms) {
-    if (!rx_post()) return usb::Status::Error;
-    usb::Status st = usb::end_read(got, timeout_ms);
-    g_rx_posted = false;
-    if (st != usb::Status::Ok) return st;
-    *buf = g_rx[g_rx_i];
-    g_rx_i ^= 1;
-    if (!rx_post()) return usb::Status::Error;
+    if (g_rx_held >= 0) {
+        if (!usb::rx_repost(g_rx_held)) return usb::Status::Error;
+        g_rx_held = -1;
+    }
+    if (!g_rx_running) {
+        if (!usb::rx_start((void *const *)g_rx, RX_N, RX_SIZE)) return usb::Status::Error;
+        g_rx_running = true;
+    }
+    int idx = -1;
+    usb::Status st = usb::rx_wait(&idx, got, timeout_ms);
+    if (st != usb::Status::Ok) { rx_reset(); return st; }
+    g_rx_held = idx;
+    *buf = g_rx[idx];
     return usb::Status::Ok;
 }
 
@@ -1076,11 +1080,10 @@ static void thread_main(void *) {
         if (!usb::wait_ready()) break;
         set_status("Cable conectado, esperando al PC...");
         log_write("mtp: cable conectado (paquete max %u)", usb::max_packet());
-        g_rx_posted = false;
-        g_rx_i = 0;
+        rx_reset();
         session_loop();
         usb::cancel_all();
-        g_rx_posted = false;
+        rx_reset();
         log_write("mtp: sesion USB terminada (cable desconectado o error USB)");
         g_session = false;
         g_send.pending = false;
@@ -1095,10 +1098,9 @@ Result start(std::atomic<bool> *quit) {
     mutexInit(&g_status_mtx);
     g_buf = (u8 *)memalign(0x1000, BUF_SIZE);
     g_buf2 = (u8 *)memalign(0x1000, BUF_SIZE);
-    g_rx[0] = (u8 *)memalign(0x1000, RX_SIZE);
-    g_rx[1] = (u8 *)memalign(0x1000, RX_SIZE);
+    for (int i = 0; i < RX_N; i++) g_rx[i] = (u8 *)memalign(0x1000, RX_SIZE);
     g_cmd = (u8 *)memalign(0x1000, 0x1000);
-    if (!g_buf || !g_buf2 || !g_cmd || !g_rx[0] || !g_rx[1]) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (!g_buf || !g_buf2 || !g_cmd || !g_rx[0] || !g_rx[1] || !g_rx[2]) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     mkdir("sdmc:/switch", 0777);
     Result rc = usb::init(quit);
     if (R_FAILED(rc)) { usb::exit(); return rc; }
@@ -1113,8 +1115,7 @@ void stop() {
     usb::exit();
     free(g_buf);
     free(g_buf2);
-    free(g_rx[0]);
-    free(g_rx[1]);
+    for (int i = 0; i < RX_N; i++) free(g_rx[i]);
     free(g_cmd);
 }
 
