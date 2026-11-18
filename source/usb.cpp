@@ -91,8 +91,13 @@ static void handle_setup() {
         // Cancel Request: recibir sus datos (código 0x4001 + id de transacción)
         g_cancel_req = true;
         u32 n = wLength < 0x1000 ? wLength : 0x1000;
+        memset(data, 0xEE, 16);
         rc = usbDsInterface_CtrlOutPostBufferAsync(g_intf, data, n, &urb);
-        log_write("    usb: control: el PC CANCELO la operacion (CtrlOut %u -> 0x%X)", n, rc);
+        svcSleepThread(20'000'000ULL); // dar tiempo a que lleguen los 6 bytes
+        armDCacheFlush(data, 16);
+        u16 code = data[0] | (data[1] << 8);
+        u32 tid = data[2] | (data[3] << 8) | (data[4] << 16) | ((u32)data[5] << 24);
+        log_write("    usb: control: el PC CANCELO (CtrlOut %u -> 0x%X): codigo 0x%04X, operacion tid 0x%X", n, rc, code, tid);
         return;
     }
     if (type == 0xA1 && req == 0x67) {
@@ -275,8 +280,9 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
     if (p.is_read) armDCacheFlush(p.buf, done);
     if (g_log_verbose) {
         const u8 *b = (const u8 *)p.buf;
-        char hex[3 * 16 + 1] = {0};
-        for (u32 i = 0; i < done && i < 16; i++) snprintf(hex + 3 * i, 4, "%02X ", b[i]);
+        char hex[3 * 32 + 1] = {0};
+        u32 lim = done <= 32 ? done : 16;
+        for (u32 i = 0; i < lim; i++) snprintf(hex + 3 * i, 4, "%02X ", b[i]);
         log_write("    usb %s %u de %u bytes (urb %u): %s", p.is_read ? "LEE" : "ESCRIBE", done, p.size, p.urb, hex);
     }
     if (out) *out = done;
