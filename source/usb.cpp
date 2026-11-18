@@ -196,6 +196,12 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
     Result parc = usbDsParseReportData(&report, p.urb, nullptr, &done);
     if (R_FAILED(parc)) { log_write("    usb: ParseReportData -> 0x%X", parc); return Status::Error; }
     if (p.is_read) armDCacheFlush(p.buf, done);
+    if (g_log_verbose) {
+        const u8 *b = (const u8 *)p.buf;
+        char hex[3 * 16 + 1] = {0};
+        for (u32 i = 0; i < done && i < 16; i++) snprintf(hex + 3 * i, 4, "%02X ", b[i]);
+        log_write("    usb %s %u de %u bytes (urb %u): %s", p.is_read ? "LEE" : "ESCRIBE", done, p.size, p.urb, hex);
+    }
     if (out) *out = done;
     return Status::Ok;
 }

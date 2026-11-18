@@ -16,10 +16,13 @@ inline std::vector<std::string> &log_lines() { static std::vector<std::string> v
 
 inline void log_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 inline void log_write(const char *fmt, ...) {
-    char line[256];
+    char line[300];
+    static u64 t0 = armTicksToNs(armGetSystemTick());
+    u64 ms = (armTicksToNs(armGetSystemTick()) - t0) / 1000000ULL;
+    int n = snprintf(line, sizeof(line), "%6llu.%03llu ", (unsigned long long)(ms / 1000), (unsigned long long)(ms % 1000));
     va_list va;
     va_start(va, fmt);
-    vsnprintf(line, sizeof(line), fmt, va);
+    vsnprintf(line + n, sizeof(line) - n, fmt, va);
     va_end(va);
 
     mutexLock(&log_mutex());
