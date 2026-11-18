@@ -20,11 +20,16 @@ jobs:
           curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/ouncebrew/ounce-devkit/main/install.sh
           sh /tmp/install.sh
       - name: Compilar
-        run: make -j$(nproc)
+        run: |
+          make -j$(nproc)
+          make -C probe -j$(nproc)
+          cp probe/usbprobe.nro .
       - uses: actions/upload-artifact@v4
         with:
           name: USBS2
-          path: USBS2.nro
+          path: |
+            USBS2.nro
+            usbprobe.nro
       - name: Publicar en Releases (ultima version)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
@@ -32,4 +37,6 @@ jobs:
           tag_name: latest
           name: USBS2 (ultima compilacion, Switch 2)
           prerelease: true
-          files: USBS2.nro
+          files: |
+            USBS2.nro
+            usbprobe.nro

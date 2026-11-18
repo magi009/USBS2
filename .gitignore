@@ -3,3 +3,4 @@ build/
 *.nacp
 *.nro
 *.map
+probe/build/
