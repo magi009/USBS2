@@ -40,6 +40,64 @@ static void dev_desc(struct usb_device_descriptor *d, u16 bcd, u8 mps0) {
     d->bNumConfigurations = 1;
 }
 
+
+// ---- IPC directo (sin usbDsInitialize de libounce) ----
+typedef struct { Service root, ds; } Raw;
+
+static Result raw_open_bind(Raw *r) {
+    memset(r, 0, sizeof(*r));
+    Result rc = smGetService(&r->root, "usb:ds");
+    if (R_FAILED(rc)) return rc;
+    rc = serviceConvertToDomain(&r->root);
+    if (R_SUCCEEDED(rc)) {
+        serviceAssumeDomain(&r->root);
+        rc = serviceDispatch(&r->root, 0, .out_num_objects = 1, .out_objects = &r->ds);
+    }
+    if (R_FAILED(rc)) { serviceClose(&r->root); return rc; }
+    const u32 cid = 2;
+    serviceAssumeDomain(&r->ds);
+    return serviceDispatchIn(&r->ds, 0, cid, .in_num_handles = 1, .in_handles = { CUR_PROCESS_HANDLE });
+}
+
+static void raw_close(Raw *r) {
+    serviceAssumeDomain(&r->ds);
+    serviceClose(&r->ds);
+    serviceClose(&r->root);
+}
+
+static Result raw_state_event(Raw *r) {
+    Handle h = INVALID_HANDLE;
+    serviceAssumeDomain(&r->ds);
+    Result rc = serviceDispatch(&r->ds, 2, .out_handle_attrs = { SfOutHandleAttr_HipcCopy }, .out_handles = &h);
+    if (R_SUCCEEDED(rc)) svcCloseHandle(h);
+    return rc;
+}
+
+static Result raw_cmd(Raw *r, u32 cmd) {
+    serviceAssumeDomain(&r->ds);
+    return serviceDispatch(&r->ds, cmd);
+}
+
+static Result raw_register(Raw *r) {
+    Service s;
+    const u8 intf = 0;
+    serviceAssumeDomain(&r->ds);
+    Result rc = serviceDispatchIn(&r->ds, 1, intf, .out_num_objects = 1, .out_objects = &s);
+    if (R_SUCCEEDED(rc)) { serviceAssumeDomain(&s); serviceClose(&s); }
+    return rc;
+}
+
+static void raw_test(const char *name, bool ev, bool clear) {
+    Raw r;
+    Result rc = raw_open_bind(&r);
+    if (R_FAILED(rc)) { out("%-34s bind -> 0x%X", name, rc); return; }
+    Result re = ev ? raw_state_event(&r) : 0;
+    Result rcl = clear ? raw_cmd(&r, 4) : 0;
+    Result rr = raw_register(&r);
+    out("%-34s ev=0x%X clear=0x%X REG=0x%X", name, re, rcl, rr);
+    raw_close(&r);
+}
+
 // Ejecuta los primeros `upto` pasos de configuración y luego intenta registrar.
 static void test_prefix(int upto) {
     static const char *names[] = {"(nada)", "+idioma", "+texto", "+desc Full", "+desc High", "+desc Super", "+BOS"};
@@ -143,7 +201,14 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
 
     g_log = fopen("sdmc:/switch/usbprobe.log", "w");
-    out("usbprobe 2 - orden de configuracion usb:ds");
+    out("usbprobe 3 - causa del bloqueo de usb:ds");
+    out("== IPC directo: bind + ... + registrar ==");
+    raw_test("V1 bind+registrar", false, false);
+    raw_test("V2 bind+evento+registrar", true, false);
+    raw_test("V3 bind+ClearDeviceData+registrar", false, true);
+    raw_test("V4 bind+evento+Clear+registrar", true, true);
+    out("");
+    out("== libounce (con parche Switch 2) ==");
     for (int i = 0; i <= 6; i++) test_prefix(i);
     test_register_first();
     out("");

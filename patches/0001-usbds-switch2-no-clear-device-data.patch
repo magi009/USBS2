@@ -1,0 +1,20 @@
+diff --git a/nx/source/services/usbds.c b/nx/source/services/usbds.c
+index e19875a..6cb84e6 100644
+--- a/nx/source/services/usbds.c
++++ b/nx/source/services/usbds.c
+@@ -52,9 +52,15 @@ Result _usbDsInitialize(void) {
+     if (R_SUCCEEDED(rc))
+         rc = _usbDsGetEvent(&g_usbDsSrv, &g_usbDsStateChangeEvent, false, hosversionAtLeast(11,0,0) ? 2 : 3);
+ 
++#ifndef __SWITCH2__
+     // Result code doesn't matter here, users can call themselves later, too. This prevents foot shooting.
+     if (R_SUCCEEDED(rc) && hosversionAtLeast(5,0,0))
+         usbDsClearDeviceData();
++#else
++    // Switch 2 (usb:ds, firmware 23.0.1): calling ClearDeviceData here leaves the
++    // service in a state where RegisterInterface fails with 0x4BB25 (2293-0605),
++    // while the same RegisterInterface succeeds right after BindDevice.
++#endif
+ 
+     return rc;
+ }
