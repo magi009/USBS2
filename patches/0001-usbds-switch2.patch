@@ -1,5 +1,5 @@
 diff --git a/nx/source/services/usbds.c b/nx/source/services/usbds.c
-index e19875a..9dbae49 100644
+index e19875a..16dcfb8 100644
 --- a/nx/source/services/usbds.c
 +++ b/nx/source/services/usbds.c
 @@ -424,12 +424,19 @@ Result usbDsRegisterInterface(UsbDsInterface** interface) {
@@ -42,3 +42,19 @@ index e19875a..9dbae49 100644
  
      if (R_FAILED(rc))
          _usbDsFreeInterface(ptr);
+@@ -696,7 +710,14 @@ Result usbDsInterface_AppendConfigurationData(UsbDsInterface* interface, UsbDevi
+     }
+ 
+     u32 in = speed;
+-    return serviceDispatchIn(&interface->s, 10, in,
++#ifdef __SWITCH2__
++    // Switch 2 (firmware 23.0.1): AppendConfigurationData is IDsInterface cmd 6
++    // (same input: u32 speed + MapAlias buffer). Cmd 10 closes the session.
++    const u32 cmd_id = 6;
++#else
++    const u32 cmd_id = 10;
++#endif
++    return serviceDispatchIn(&interface->s, cmd_id, in,
+         .buffer_attrs = { SfBufferAttr_HipcMapAlias | SfBufferAttr_In },
+         .buffers = { { buffer, size } },
+     );
