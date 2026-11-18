@@ -24,6 +24,8 @@ Botones al abrir la app (mantenlos mientras la abres):
 - **R** – modo seguro: sin partidas guardadas.
 - **ZL** – registro detallado: anota cada operación en `USBS2.log` (más lento; solo para diagnosticar). Con la app abierta, **Y** lo activa o desactiva.
 
+Con la app abierta, **X dos veces** activa o desactiva USB 3 para apps caseras (ajuste del sistema `usb!usb30_force_enabled`). Se guarda en la consola y hace falta **reiniciarla** para que se aplique. Por defecto viene desactivado; en la Switch 1, USB 3 puede interferir con el Wi-Fi de 2,4 GHz y los mandos inalámbricos.
+
 El registro está en `sdmc:/switch/USBS2.log`. Si el USB no arranca, el error también sale en pantalla.
 
 ## Avisos

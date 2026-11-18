@@ -19,6 +19,28 @@ static void step(const char *s) {
     consoleUpdate(nullptr);
 }
 
+// Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
+static int read_usb3() {
+    int out = -1;
+    if (R_SUCCEEDED(setsysInitialize())) {
+        u8 v = 0; u64 sz = 0;
+        Result r = setsysGetSettingsItemValue("usb", "usb30_force_enabled", &v, sizeof(v), &sz);
+        if (R_SUCCEEDED(r)) out = v ? 1 : 0;
+        else log_write("    ajuste usb!usb30_force_enabled: no se puede leer (0x%X)", r);
+        setsysExit();
+    }
+    return out;
+}
+
+// Escribe usb!usb30_force_enabled (solo cuando el usuario lo pide con X dos veces).
+static Result write_usb3(u8 v) {
+    Result rc = setfdInitialize();
+    if (R_FAILED(rc)) return rc;
+    rc = setfdSetSettingsItemValue("usb", "usb30_force_enabled", &v, sizeof(v));
+    setfdExit();
+    return rc;
+}
+
 int main(int, char **) {
     remove("sdmc:/USBS2.log");          // log viejo en la raíz (versiones anteriores)
     // Se conserva el log de la sesión anterior (por si la app se cerró o se cayó).
@@ -39,7 +61,7 @@ int main(int, char **) {
     }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.7.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.7.1 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
@@ -51,14 +73,9 @@ int main(int, char **) {
         step("[3] MODO SEGURO: partidas desactivadas");
     }
 
-    // Solo lectura: ajuste que en la Switch 1 activa USB 3 para homebrew (usb!usb30_force_enabled).
-    if (R_SUCCEEDED(setsysInitialize())) {
-        u8 v = 0xFF; u64 sz = 0;
-        Result r = setsysGetSettingsItemValue("usb", "usb30_force_enabled", &v, sizeof(v), &sz);
-        if (R_SUCCEEDED(r)) log_write("    ajuste usb!usb30_force_enabled = %u", v);
-        else log_write("    ajuste usb!usb30_force_enabled: no existe (0x%X)", r);
-        setsysExit();
-    }
+    // Ajuste que deja usar USB 3 a las apps caseras (usb!usb30_force_enabled).
+    int usb3 = read_usb3();
+    if (usb3 >= 0) log_write("    ajuste usb!usb30_force_enabled = %d", usb3);
     step("[4] iniciando USB (usb:ds)...");
     Result rc = mtp::start(&quit);
     log_write("    resultado USB: 0x%X", rc);
@@ -67,17 +84,38 @@ int main(int, char **) {
 
     char line[128];
     u64 bytes = 0;
+    u64 x_armed_until = 0;   // X hay que pulsarlo dos veces (confirmación)
+    char usb3_msg[96] = "";
     while (appletMainLoop()) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
+        if (down & HidNpadButton_X) {
+            u64 t = armTicksToNs(armGetSystemTick());
+            if (t < x_armed_until) {
+                x_armed_until = 0;
+                u8 nv = usb3 == 1 ? 0 : 1;
+                Result r = write_usb3(nv);
+                int after = read_usb3();
+                log_write("USB 3: cambiar a %u -> 0x%X, ahora vale %d", nv, r, after);
+                if (R_SUCCEEDED(r) && after == nv) {
+                    usb3 = after;
+                    snprintf(usb3_msg, sizeof(usb3_msg), "Guardado. REINICIA la consola para que se aplique.");
+                } else {
+                    snprintf(usb3_msg, sizeof(usb3_msg), "No se pudo cambiar (error 0x%X).", r);
+                }
+            } else {
+                x_armed_until = t + 3'000'000'000ULL;
+                snprintf(usb3_msg, sizeof(usb3_msg), "Pulsa X otra vez (3 s) para %s USB 3.", usb3 == 1 ? "DESACTIVAR" : "ACTIVAR");
+            }
+        }
         if (down & HidNpadButton_Y) {
             g_log_verbose = !g_log_verbose;
             log_write("registro detallado: %s (boton Y)", g_log_verbose ? "ACTIVADO" : "desactivado");
         }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.7.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.7.1 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -103,7 +141,8 @@ int main(int, char **) {
             printf("  - Partidas guardadas   -> una carpeta por juego/usuario\x1b[K\n\n");
             printf("Cierra los juegos antes de tocar sus partidas.\x1b[K\n");
         }
-        printf("\nRegistro: sdmc:/switch/USBS2.log   Detallado: %s (Y = cambiar)\x1b[K\n", g_log_verbose ? "SI" : "no");
+        printf("\nUSB 3 para apps caseras: %s (X = cambiar)  %s\x1b[K\n", usb3 == 1 ? "ACTIVADO" : usb3 == 0 ? "desactivado" : "desconocido", usb3_msg);
+        printf("Registro: sdmc:/switch/USBS2.log   Detallado: %s (Y = cambiar)\x1b[K\n", g_log_verbose ? "SI" : "no");
         printf("Pulsa + o B para salir.\x1b[K\n");
         consoleUpdate(nullptr);
         svcSleepThread(50'000'000ULL);
