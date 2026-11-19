@@ -6,7 +6,7 @@ namespace usb {
 enum class Status { Ok, Timeout, Error };
 
 Result init(std::atomic<bool> *quit_flag);
-void exit();
+bool exit(u64 timeout_ns = 3'000'000'000ULL); // false: un hilo no terminó (no se cierra usb:ds)
 bool wait_ready();      // espera a que el PC configure el dispositivo
 u32 max_packet();       // tamaño máximo de paquete bulk (se mide al conectar)
 
@@ -29,6 +29,8 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms = 0);
 bool rx_repost(int idx);
 void rx_stop();
 u32 setup_count();
+const char *where();        // última llamada USB del hilo de transferencias
+const char *where_ctrl();   // última llamada USB del hilo de control
 bool cancel_requested();   // el PC canceló la operación en curso (Cancel Request)
 void clear_cancel();   // peticiones recibidas por el canal de control (diagnóstico)
 }

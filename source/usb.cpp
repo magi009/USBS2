@@ -5,6 +5,12 @@
 
 namespace usb {
 
+// Última llamada al sistema USB de cada hilo (para saber dónde se queda colgado).
+static std::atomic<const char *> g_where{"inicio"}, g_where_ctrl{"inicio"};
+const char *where() { return g_where.load(); }
+const char *where_ctrl() { return g_where_ctrl.load(); }
+
+
 static UsbDsInterface *g_intf = nullptr;
 static UsbDsEndpoint *g_ep_in = nullptr, *g_ep_out = nullptr, *g_ep_irq = nullptr;
 static std::atomic<bool> *g_quit = nullptr;
@@ -79,6 +85,7 @@ static void handle_setup() {
     alignas(0x1000) static u8 pkt[0x1000];
     alignas(0x1000) static u8 data[0x1000];
     memset(pkt, 0, 8);
+    g_where_ctrl = "GetSetupPacket";
     Result rc = usbDsInterface_GetSetupPacket(g_intf, pkt, 8);
     log_debug("    usb: control: %02X %02X %02X %02X %02X %02X %02X %02X (0x%X)", pkt[0], pkt[1], pkt[2], pkt[3],
               pkt[4], pkt[5], pkt[6], pkt[7], rc);
@@ -92,6 +99,7 @@ static void handle_setup() {
         g_cancel_req = true;
         u32 n = wLength < 0x1000 ? wLength : 0x1000;
         memset(data, 0xEE, 16);
+        g_where_ctrl = "CtrlOut";
         rc = usbDsInterface_CtrlOutPostBufferAsync(g_intf, data, n, &urb);
         svcSleepThread(20'000'000ULL); // dar tiempo a que lleguen los 6 bytes
         armDCacheFlush(data, 16);
@@ -104,6 +112,7 @@ static void handle_setup() {
         // Get Device Status: largo (4) + OK (0x2001)
         data[0] = 4; data[1] = 0; data[2] = 0x01; data[3] = 0x20;
         u32 n = wLength < 4 ? wLength : 4;
+        g_where_ctrl = "CtrlIn";
         rc = usbDsInterface_CtrlInPostBufferAsync(g_intf, data, n, &urb);
         if (R_FAILED(rc)) log_write("    usb: control: GET_DEVICE_STATUS: CtrlIn -> 0x%X", rc);
         else log_debug("    usb: control: GET_DEVICE_STATUS -> OK");
@@ -115,6 +124,7 @@ static void handle_setup() {
 static void setup_watch(void *) {
     while (!g_quit->load()) {
         if (!g_intf) { svcSleepThread(100'000'000ULL); continue; }
+        g_where_ctrl = "esperando control";
         Result rc = eventWait(&g_intf->SetupEvent, 100'000'000ULL);
         if (R_FAILED(rc)) continue;
         eventClear(&g_intf->SetupEvent);
@@ -195,13 +205,17 @@ Result init(std::atomic<bool> *quit_flag) {
     return 0;
 }
 
-void exit() {
+bool exit(u64 timeout_ns) {
     if (g_setup_thread_ok) {
-        threadWaitForExit(&g_setup_thread);
+        if (R_FAILED(waitSingleHandle(g_setup_thread.handle, timeout_ns))) {
+            log_write("salida: el hilo de control USB no termina (ultima llamada: %s)", where_ctrl());
+            return false;
+        }
         threadClose(&g_setup_thread);
         g_setup_thread_ok = false;
     }
     usbDsExit();
+    return true;
 }
 
 static void update_max_packet();
@@ -209,6 +223,7 @@ static void update_max_packet();
 bool wait_ready() {
     Result last = 0;
     while (!g_quit->load()) {
+        g_where = "WaitReady";
         Result rc = usbDsWaitReady(100'000'000ULL);
         if (R_SUCCEEDED(rc)) { update_max_packet(); return true; }
         if (rc != last) { log_debug("    usb: usbDsWaitReady -> 0x%X", rc); last = rc; }
@@ -222,6 +237,7 @@ u32 max_packet() { return g_mps; }
 
 static void update_max_packet() {
     UsbDeviceSpeed sp = UsbDeviceSpeed_None;
+    g_where = "GetSpeed";
     Result rc = usbDsGetSpeed(&sp);
     g_mps = 0x200;
     if (R_SUCCEEDED(rc)) {
@@ -238,6 +254,7 @@ static Pending g_rd = {}, g_wr = {};
 static bool begin(Pending &p, UsbDsEndpoint *ep, void *buf, u32 size, bool is_read) {
     if (!is_read) armDCacheFlush(buf, size);
     p = {ep, buf, size, 0, false, is_read};
+    g_where = "PostBuffer";
     Result rc = usbDsEndpoint_PostBufferAsync(ep, buf, size, &p.urb);
     if (R_FAILED(rc)) { log_write("    usb: PostBufferAsync(%u) -> 0x%X", size, rc); return false; }
     p.active = true;
@@ -246,7 +263,9 @@ static bool begin(Pending &p, UsbDsEndpoint *ep, void *buf, u32 size, bool is_re
 
 static void cancel(Pending &p) {
     if (!p.active) return;
+    g_where = "Cancel";
     usbDsEndpoint_Cancel(p.ep);
+    g_where = "Cancel (esperando)";
     eventWait(&p.ep->CompletionEvent, 1'000'000'000ULL);
     eventClear(&p.ep->CompletionEvent);
     p.active = false;
@@ -261,6 +280,7 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
         waited_ms += 100;
         if (g_quit->load()) { cancel(p); return Status::Error; }
         UsbState st;
+        g_where = "GetState";
         if (R_SUCCEEDED(usbDsGetState(&st)) && st != UsbState_Configured) {
             log_write("    usb: cable desconectado (estado %d)", (int)st);
             cancel(p);
@@ -272,6 +292,7 @@ static Status finish(Pending &p, u32 *out, u32 timeout_ms) {
     eventClear(&p.ep->CompletionEvent);
     p.active = false;
     UsbDsReportData report;
+    g_where = "GetReportData";
     Result grc = usbDsEndpoint_GetReportData(p.ep, &report);
     if (R_FAILED(grc)) { log_write("    usb: GetReportData -> 0x%X", grc); return Status::Error; }
     u32 done = 0;
@@ -309,6 +330,7 @@ static struct {
 bool rx_repost(int i) {
     if (i < 0 || i >= g_rxq.n || g_rxq.posted[i]) return true;
     armDCacheFlush(g_rxq.buf[i], g_rxq.size);
+    g_where = "PostBuffer rx";
     Result rc = usbDsEndpoint_PostBufferAsync(g_ep_out, g_rxq.buf[i], g_rxq.size, &g_rxq.urb[i]);
     if (R_FAILED(rc)) { log_write("    usb: rx PostBufferAsync -> 0x%X", rc); return false; }
     g_rxq.posted[i] = true;
@@ -331,7 +353,9 @@ void rx_stop() {
     bool any = false;
     for (int i = 0; i < g_rxq.n; i++) any |= g_rxq.posted[i];
     if (any) {
+        g_where = "Cancel rx";
         usbDsEndpoint_Cancel(g_ep_out);
+        g_where = "Cancel rx (esperando)";
         eventWait(&g_ep_out->CompletionEvent, 1'000'000'000ULL);
         eventClear(&g_ep_out->CompletionEvent);
     }
@@ -359,6 +383,7 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
     u64 waited_ms = 0;
     for (;;) {
         UsbDsReportData report{};
+        g_where = "GetReportData rx";
         if (R_SUCCEEDED(usbDsEndpoint_GetReportData(g_ep_out, &report))) {
             // El informe solo trae cada finalización una vez: se guardan todas las
             // que aparezcan, aunque no sean la que buscamos ahora.
@@ -418,6 +443,7 @@ Status rx_wait(int *idx, u32 *got, u32 timeout_ms) {
         waited_ms += 100;
         if (g_quit->load()) return Status::Error;
         UsbState st;
+        g_where = "GetState";
         if (R_SUCCEEDED(usbDsGetState(&st)) && st != UsbState_Configured) {
             log_write("    usb: cable desconectado (estado %d)", (int)st);
             return Status::Error;

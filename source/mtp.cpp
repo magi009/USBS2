@@ -1202,14 +1202,20 @@ Result start(std::atomic<bool> *quit) {
     return rc;
 }
 
-void stop() {
-    threadWaitForExit(&g_thread);
+bool stop() {
+    // Nunca dejar la app colgada al salir: si el hilo USB no responde en 3 s, se
+    // sale igual (el sistema libera todo al cerrar la app) y se anota dónde estaba.
+    if (R_FAILED(waitSingleHandle(g_thread.handle, 3'000'000'000ULL))) {
+        log_write("salida: el hilo USB no termina (ultima llamada: %s); salida forzada", usb::where());
+        return false;
+    }
     threadClose(&g_thread);
-    usb::exit();
+    if (!usb::exit()) return false;
     free(g_buf);
     free(g_buf2);
     for (int i = 0; i < RX_N; i++) free(g_rx[i]);
     free(g_cmd);
+    return true;
 }
 
 } // namespace mtp

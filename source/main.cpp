@@ -52,7 +52,7 @@ int main(int, char **) {
     }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.7.2 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.7.3 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
@@ -85,7 +85,7 @@ int main(int, char **) {
         }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.7.2 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.7.3 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -104,6 +104,7 @@ int main(int, char **) {
                 last_tick = now;
             }
             printf("Conexion: %s   Peticiones de control: %u\x1b[K\n", mtp::link_name(), usb::setup_count());
+            if (g_log_verbose) printf("USB ahora: %s / control: %s\x1b[K\n", usb::where(), usb::where_ctrl());
             printf("Transferido: %.1f MB   Velocidad: %.1f MB/s\x1b[K\n\n", bytes / 1048576.0, mbps);
             printf("En el PC veras:\x1b[K\n");
             printf("  - Tarjeta SD           -> sdmc:/\x1b[K\n");
@@ -119,8 +120,9 @@ int main(int, char **) {
 
     log_write("salida normal");
     quit = true;
-    if (R_SUCCEEDED(rc)) mtp::stop();
-    saves::exit();
+    bool clean = R_FAILED(rc) || mtp::stop();
+    if (clean) saves::exit();
+    log_write("salida %s", clean ? "limpia" : "forzada");
     consoleExit(nullptr);
     return 0;
 }
