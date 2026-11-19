@@ -52,7 +52,7 @@ int main(int, char **) {
     }
     bool safe = held & HidNpadButton_R;
     g_log_verbose = held & HidNpadButton_ZL;
-    log_write("USBS2 1.7.3 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
+    log_write("USBS2 1.8.0 | firmware %u.%u.%u | modo seguro: %s | registro detallado: %s",
               HOSVER_MAJOR(hosversionGet()), HOSVER_MINOR(hosversionGet()), HOSVER_MICRO(hosversionGet()),
               safe ? "si" : "no", g_log_verbose ? "si" : "no");
 
@@ -85,7 +85,7 @@ int main(int, char **) {
         }
 
         printf("\x1b[1;1H");
-        printf("USBS2 1.7.3 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
+        printf("USBS2 1.8.0 - Transferencia USB (MTP)%s%s\x1b[K\n", safe ? "  [MODO SEGURO]" : "", g_log_verbose ? "  [REGISTRO DETALLADO]" : "");
         printf("--------------------------------\x1b[K\n\n");
         if (R_FAILED(rc)) {
             printf("Error iniciando USB: 0x%X\x1b[K\n", rc);
@@ -106,6 +106,25 @@ int main(int, char **) {
             printf("Conexion: %s   Peticiones de control: %u\x1b[K\n", mtp::link_name(), usb::setup_count());
             if (g_log_verbose) printf("USB ahora: %s / control: %s\x1b[K\n", usb::where(), usb::where_ctrl());
             printf("Transferido: %.1f MB   Velocidad: %.1f MB/s\x1b[K\n\n", bytes / 1048576.0, mbps);
+            // Barra de progreso del archivo en curso
+            mtp::Progress px;
+            mtp::progress(&px);
+            if (px.dir) {
+                double frac = px.total ? (double)px.done / px.total : 1.0;
+                if (frac > 1) frac = 1;
+                const int W = 50;
+                int fill = (int)(frac * W + 0.5);
+                char bar[W + 1];
+                for (int i = 0; i < W; i++) bar[i] = i < fill ? '#' : '-';
+                bar[W] = 0;
+                printf("%s: %.60s\x1b[K\n", px.dir == 1 ? "PC -> consola" : "Consola -> PC", px.name);
+                printf("[\x1b[32m%.*s\x1b[0m%s] %3d%%\x1b[K\n", fill, bar, bar + fill, (int)(frac * 100));
+                double left_s = mbps > 0.1 ? (px.total - px.done) / 1048576.0 / mbps : 0;
+                printf("%.1f de %.1f MB   quedan %.0f s   Archivos copiados: %u\x1b[K\n\n",
+                       px.done / 1048576.0, px.total / 1048576.0, left_s, px.files);
+            } else {
+                printf("Sin copias en curso.   Archivos copiados: %u\x1b[K\n\x1b[K\n\x1b[K\n\n", px.files);
+            }
             printf("En el PC veras:\x1b[K\n");
             printf("  - Tarjeta SD           -> sdmc:/\x1b[K\n");
             printf("  - Homebrew             -> sdmc:/switch\x1b[K\n");

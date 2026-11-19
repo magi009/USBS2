@@ -69,6 +69,11 @@ static u8 *g_cmd;   // comandos y respuestas (alineado 0x1000)
 static Mutex g_status_mtx;
 static char g_status[128] = "Esperando cable USB...";
 static std::atomic<u64> g_bytes{0};
+// Progreso del archivo en curso (para la barra en pantalla).
+static std::atomic<int> g_px_dir{0};          // 0 nada, 1 PC -> consola, 2 consola -> PC
+static std::atomic<u64> g_px_done{0}, g_px_total{0};
+static std::atomic<u32> g_px_files{0};
+static char g_px_name[96] = "";
 static bool g_session = false;
 
 // Si el PC deja de mandar/recibir datos A MITAD de una transferencia durante
@@ -126,6 +131,30 @@ const char *link_name() {
     case 0x40: return "USB 1.1 (12 Mb/s)";
     default: return "USB 2.0 (480 Mb/s)";
     }
+}
+
+static void px_begin(int dir, const std::string &path, u64 total) {
+    mutexLock(&g_status_mtx);
+    size_t sl = path.rfind('/');
+    snprintf(g_px_name, sizeof(g_px_name), "%s", sl == std::string::npos ? path.c_str() : path.c_str() + sl + 1);
+    mutexUnlock(&g_status_mtx);
+    g_px_done = 0;
+    g_px_total = total;
+    g_px_dir = dir;
+}
+static void px_end(bool completed) {
+    g_px_dir = 0;
+    if (completed) g_px_files++;
+}
+
+void progress(Progress *out) {
+    out->dir = g_px_dir.load();
+    out->done = g_px_done.load();
+    out->total = g_px_total.load();
+    out->files = g_px_files.load();
+    mutexLock(&g_status_mtx);
+    snprintf(out->name, sizeof(out->name), "%s", g_px_name);
+    mutexUnlock(&g_status_mtx);
 }
 
 void status(char *out, size_t size, u64 *bytes) {
@@ -690,10 +719,11 @@ static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 l
         return start + want;
     };
     set_status("Enviando %s", path.c_str());
+    px_begin(2, path, len);
     put_header(g_buf, total, c.code, c.tid);
     u8 *cur = g_buf;
     u32 n = fill(cur, 12);
-    bool dead = false;
+    bool dead = false, first = true;
     for (;;) {
         if (!usb::begin_write(cur, n)) { dead = true; break; }
         u8 *nxt = cur == g_buf ? g_buf2 : g_buf;
@@ -702,11 +732,14 @@ static bool stream_file(const Cmd &c, const std::string &path, u64 offset, u64 l
         if (st == usb::Status::Error) { dead = true; break; }
         if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de leer %u s", IO_TIMEOUT_MS / 1000); break; }
         g_bytes += n;
+        g_px_done += first ? n - 12 : n;
+        first = false;
         if (nn == 0) break;
         cur = nxt;
         n = nn;
     }
     close(fd);
+    px_end(!dead && !g_aborted);
     set_status("Conectado al PC");
     if (dead) return false;
     if (g_aborted) return true;
@@ -867,6 +900,7 @@ static bool op_send_object(const Cmd &c) {
     bool presized = !werr && g_send.size && ftruncate(fd, (off_t)g_send.size) == 0;
     u64 written = 0, t0 = now_ns(), sd_ns = 0;
     set_status("Recibiendo %s", g_send.path.c_str());
+    px_begin(1, g_send.path, g_send.size);
     bool ok = recv_data([&](const u8 *p, size_t n) {
         if (werr) return false;
         u64 t = now_ns();
@@ -878,8 +912,10 @@ static bool op_send_object(const Cmd &c) {
         }
         sd_ns += now_ns() - t;
         written += done;
+        g_px_done = written;
         return !werr;
     });
+    px_end(!g_aborted && !werr && ok);
     if (fd >= 0) {
         if (presized && !g_aborted && written != g_send.size) ftruncate(fd, (off_t)written);
         close(fd);
