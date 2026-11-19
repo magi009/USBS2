@@ -1,14 +1,13 @@
 #pragma once
-// Registro de diagnóstico: se guarda en memoria (para mostrarlo en pantalla)
-// y en sdmc:/switch/USBS2.log.
+// Registro de diagnóstico. Siempre se guarda en memoria (últimas 200 líneas);
+// solo se escribe en sdmc:/switch/USBS2.log cuando el usuario lo activa con Y.
 #include <switch.h>
 #include <cstdio>
 #include <cstdarg>
 #include <string>
 #include <vector>
 
-// Registro detallado (cada operación MTP y cada paso USB). Se activa manteniendo
-// ZL al abrir la app; si no, solo se registran el arranque y los errores.
+// Registro activado (botón Y): escribe el archivo y anota cada operación MTP/USB.
 inline bool g_log_verbose = false;
 
 inline Mutex &log_mutex() { static Mutex m = {}; return m; }
@@ -29,10 +28,29 @@ inline void log_write(const char *fmt, ...) {
     auto &v = log_lines();
     v.push_back(line);
     if (v.size() > 200) v.erase(v.begin());
-    if (FILE *f = fopen("sdmc:/switch/USBS2.log", "a")) {
-        fprintf(f, "%s\n", line);
-        fclose(f);
+    if (g_log_verbose)
+        if (FILE *f = fopen("sdmc:/switch/USBS2.log", "a")) {
+            fprintf(f, "%s\n", line);
+            fclose(f);
+        }
+    mutexUnlock(&log_mutex());
+}
+
+// Activa o desactiva el registro. La primera vez en la sesión guarda el log
+// anterior como USBS2-anterior.log y vuelca lo que ya había en memoria.
+inline void log_enable(bool on) {
+    static bool started = false;
+    mutexLock(&log_mutex());
+    if (on && !started) {
+        started = true;
+        remove("sdmc:/switch/USBS2-anterior.log");
+        rename("sdmc:/switch/USBS2.log", "sdmc:/switch/USBS2-anterior.log");
+        if (FILE *f = fopen("sdmc:/switch/USBS2.log", "w")) {
+            for (auto &l : log_lines()) fprintf(f, "%s\n", l.c_str());
+            fclose(f);
+        }
     }
+    g_log_verbose = on;
     mutexUnlock(&log_mutex());
 }
 

@@ -22,7 +22,7 @@ La última compilación está siempre en **Releases → latest** (`USBS2.nro`).
 
 Botones al abrir la app (mantenlos mientras la abres):
 - **R** – modo seguro: sin partidas guardadas.
-- **ZL** – registro detallado: anota cada operación en `USBS2.log` (más lento; solo para diagnosticar). Con la app abierta, **Y** lo activa o desactiva.
+- **Y** (con la app abierta) – activa o desactiva el registro `sdmc:/switch/USBS2.log`. Empieza desactivado: no se escribe nada hasta pulsar Y. Al activarlo se ven las últimas líneas en pantalla. Si el USB no arranca, el registro se activa solo.
 
 
 El registro está en `sdmc:/switch/USBS2.log`. Si el USB no arranca, el error también sale en pantalla.
@@ -52,3 +52,6 @@ El servicio `usb:ds` de la Switch 2 no es igual al de la Switch 1. libounce usab
 El resto de comandos que usa MTP funcionan igual: RegisterInterface, GetSetupEvent, RegisterEndpoint, los de endpoint, descriptores, BOS, Enable, GetState y GetSpeed. Con el parche, los eventos de control (`CtrlInCompletionEvent`/`CtrlOutCompletionEvent`) quedan sin inicializar, así que no se pueden usar transferencias de control propias; los endpoints bulk e interrupt funcionan.
 
 `probe/` (`usbprobe.nro`) es la herramienta con la que se descubrió esto: prueba cada comando de `usb:ds` en una sesión nueva y anota el resultado en `sdmc:/switch/usbprobe.log`.
+
+## Créditos
+Fuente: [Inter](https://rsms.me/inter/) (SIL Open Font License), incluida como atlas en `data/font.bin` (se genera con `tools/make_font.py`).
