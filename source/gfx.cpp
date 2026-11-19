@@ -210,7 +210,14 @@ bool init() {
             float dx = (i - 200) / 900.0f, dy = (j - 60) / 600.0f;
             float glow = 1.0f - (dx * dx + dy * dy);
             u32 c = glow > 0 ? lerp_rgb(base, 0x1A5BC4, glow * 0.35f) : base;
-            g_bg[j * W + i] = to565(c);
+            // tramado 4x4: evita las franjas del degradado en 16 bits
+            static const u8 bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+            int t = bayer[(j & 3) * 4 + (i & 3)];
+            int r = ((c >> 16) & 255) + (t >> 1), g = ((c >> 8) & 255) + (t >> 2), b = (c & 255) + (t >> 1);
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            g_bg[j * W + i] = to565(((u32)r << 16) | ((u32)g << 8) | (u32)b);
         }
     }
     g_ok = true;
