@@ -14,7 +14,7 @@
 #include "usb.h"
 #include "saves.h"
 
-#define APP_VER "1.9.2"
+#define APP_VER "1.9.3"
 
 // Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
 static int read_usb3() {
@@ -68,8 +68,14 @@ static void fmt_time(char *out, size_t n, double s) {
     else snprintf(out, n, "%d h %02d min", (int)s / 3600, ((int)s % 3600) / 60);
 }
 
+static bool g_last_crash = false;
+
 int main(int, char **) {
     remove("sdmc:/USBS2.log");   // log viejo en la raíz (versiones antiguas)
+    if (FILE *cf = fopen("sdmc:/switch/USBS2-crash.txt", "r")) {   // hubo una caída la vez anterior
+        fclose(cf);
+        g_last_crash = true;
+    }
     log_write("[1] inicio");
     bool gfx_ok = gfx::init();
     if (!gfx_ok) {
@@ -207,6 +213,11 @@ int main(int, char **) {
                 gfx::text(gfx::Small, 90, 334, C_RED, "AVISO");
                 gfx::text(gfx::Big, 90, 362, C_WHITE, line, 1100);
                 gfx::text(gfx::Body, 90, 410, C_TEXT2, "Activa el registro con Y para ver los detalles.");
+                gfx::round_rect(90, 450, 1100, 26, 13, C_TRACK);
+            } else if (g_last_crash) {
+                gfx::text(gfx::Small, 90, 334, C_RED, "LA APP SE CERRO LA VEZ ANTERIOR");
+                gfx::text(gfx::Big, 90, 362, C_WHITE, "Se guardo el informe en switch/USBS2-crash.txt");
+                gfx::text(gfx::Body, 90, 410, C_TEXT2, "Copia ese archivo al PC y envialo para arreglarlo.");
                 gfx::round_rect(90, 450, 1100, 26, 13, C_TRACK);
             } else {
                 gfx::text(gfx::Big, 90, 360, C_WHITE, "Sin copias en curso");

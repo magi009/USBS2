@@ -36,6 +36,7 @@ jobs:
           name: USBS2
           path: |
             USBS2.nro
+            USBS2.elf
             usbprobe.nro
       - name: Publicar en Releases (ultima version)
         if: github.ref == 'refs/heads/main'
@@ -46,4 +47,5 @@ jobs:
           prerelease: true
           files: |
             USBS2.nro
+            USBS2.elf
             usbprobe.nro

@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:=	USBS2
 APP_AUTHOR	:=	USBS2
-APP_VERSION	:=	1.9.2
+APP_VERSION	:=	1.9.3
 
 TARGET		:=	USBS2
 BUILD		:=	build
@@ -54,7 +54,7 @@ INCLUDES	:=	include
 #---------------------------------------------------------------------------------
 ARCH	:=	$(SWITCH2_CPU) -mtp=soft -fPIE
 
-CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
+CFLAGS	:=	-g -Wall -O2 -fno-omit-frame-pointer -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
