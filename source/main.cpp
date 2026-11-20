@@ -8,13 +8,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
 #include "gfx.h"
 #include "log.h"
 #include "mtp.h"
 #include "usb.h"
 #include "saves.h"
 
-#define APP_VER "1.9.3"
+#define APP_VER "1.9.4"
 
 // Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
 static int read_usb3() {
@@ -70,6 +71,12 @@ static void fmt_time(char *out, size_t n, double s) {
 
 static bool g_last_crash = false;
 
+// Anota los avisos del sistema (foco, modo, rendimiento, reposo...) por si alguno coincide con un cierre.
+static void applet_hook(AppletHookType t, void *) {
+    log_write("sistema: aviso %d (foco %d, modo %d)", (int)t, (int)appletGetFocusState(), (int)appletGetOperationMode());
+}
+static AppletHookCookie g_hook;
+
 int main(int, char **) {
     remove("sdmc:/USBS2.log");   // log viejo en la raíz (versiones antiguas)
     if (FILE *cf = fopen("sdmc:/switch/USBS2-crash.txt", "r")) {   // hubo una caída la vez anterior
@@ -77,6 +84,7 @@ int main(int, char **) {
         g_last_crash = true;
     }
     log_write("[1] inicio");
+    appletHook(&g_hook, applet_hook, nullptr);
     bool gfx_ok = gfx::init();
     if (!gfx_ok) {
         // Sin gráficos: al menos que quede el registro para saber por qué.
@@ -133,6 +141,12 @@ int main(int, char **) {
 
         if (R_SUCCEEDED(rc)) mtp::status(line, sizeof(line), &bytes);
         u64 now = armTicksToNs(armGetSystemTick());
+        static u64 last_mem = 0;
+        if (g_log_verbose && now - last_mem >= 5'000'000'000ULL) {
+            last_mem = now;
+            struct mallinfo mi = mallinfo();
+            log_write("memoria: en uso %d KB, libre en el heap %d KB", mi.uordblks / 1024, mi.fordblks / 1024);
+        }
         if (now - last_tick >= 1'000'000'000ULL) {
             mbps = last_tick ? (bytes - last_bytes) / 1048576.0 / ((now - last_tick) / 1e9) : 0;
             last_bytes = bytes;
