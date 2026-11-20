@@ -87,7 +87,7 @@ static u32 g_pending_len = 0;
 // se procesa un bloque, las otras siguen recibiendo: nunca hay un instante en que
 // el PC mande datos sin nadie escuchando (en Switch 2 eso hace que Windows cancele).
 static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
-static constexpr int RX_N = 3;
+static constexpr int RX_N = 1;   // Switch 2: una sola lectura pendiente (con 3 el sistema USB acababa cayendo en copias largas)
 static u8 *g_rx[RX_N];
 static bool g_rx_running = false;
 static int g_rx_held = -1;     // buffer que se está procesando (se vuelve a publicar en rx_next)
