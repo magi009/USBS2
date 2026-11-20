@@ -87,7 +87,10 @@ static u32 g_pending_len = 0;
 // se procesa un bloque, las otras siguen recibiendo: nunca hay un instante en que
 // el PC mande datos sin nadie escuchando (en Switch 2 eso hace que Windows cancele).
 static constexpr u32 RX_SIZE = 2 * 1024 * 1024;
-static constexpr int RX_N = 1;   // Switch 2: una sola lectura pendiente (con 3 el sistema USB acababa cayendo en copias largas)
+// Dos búferes pero NUNCA más de una lectura USB pendiente: con 3 pendientes el sistema
+// USB de la Switch 2 acababa cayendo (2162-0002) en copias largas. Mientras se escribe
+// un búfer en la micro, el otro ya está recibiendo.
+static constexpr int RX_N = 2;
 static u8 *g_rx[RX_N];
 static bool g_rx_running = false;
 static int g_rx_held = -1;     // buffer que se está procesando (se vuelve a publicar en rx_next)
@@ -99,18 +102,22 @@ static void rx_reset() {
 }
 
 // Devuelve el siguiente bloque recibido (válido hasta la siguiente llamada).
+// Siempre hay exactamente una lectura publicada: se espera la que está en marcha y,
+// en cuanto termina, se publica el búfer libre (el anterior) antes de devolver la nueva.
 static usb::Status rx_next(u8 **buf, u32 *got, u32 timeout_ms) {
-    if (g_rx_held >= 0) {
-        if (!usb::rx_repost(g_rx_held)) return usb::Status::Error;
-        g_rx_held = -1;
-    }
     if (!g_rx_running) {
-        if (!usb::rx_start((void *const *)g_rx, RX_N, RX_SIZE)) return usb::Status::Error;
+        if (!usb::rx_start((void *const *)g_rx, RX_N, RX_SIZE, 1)) return usb::Status::Error;
         g_rx_running = true;
+        g_rx_held = -1;
     }
     int idx = -1;
     usb::Status st = usb::rx_wait(&idx, got, timeout_ms);
     if (st != usb::Status::Ok) { rx_reset(); return st; }
+    for (int i = 0; i < RX_N; i++)
+        if (i != idx && !usb::rx_posted(i)) {
+            if (!usb::rx_repost(i)) { rx_reset(); return usb::Status::Error; }
+            break;
+        }
     g_rx_held = idx;
     *buf = g_rx[idx];
     return usb::Status::Ok;
@@ -815,6 +822,66 @@ static bool op_delete(const Cmd &c) {
 // estado entre SendObjectInfo y SendObject
 static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; bool presized = false; } g_send;
 
+// ---------------- copia interrumpida ----------------
+// Mientras se recibe un archivo a la micro, su ruta queda anotada aquí. Si la consola
+// se cae o se corta el cable, al volver a abrir la app se borra el archivo a medias
+// (para que no parezca completo) y se avisa de desde qué archivo hay que seguir.
+static const char *JOURNAL = "sdmc:/switch/USBS2-copia.txt";
+static std::string g_interrupted;   // archivo que quedó a medias la vez anterior
+
+static void journal_set(const std::string &path, u64 size) {
+    if (path.rfind("sdmc:/", 0) != 0) return;   // solo micro SD (no partidas)
+    if (FILE *f = fopen(JOURNAL, "w")) {
+        fprintf(f, "%s\n%llu\n", path.c_str(), (unsigned long long)size);
+        fclose(f);
+    }
+}
+static void journal_clear() { remove(JOURNAL); }
+
+static std::string base_name(const std::string &p) {
+    size_t sl = p.rfind('/');
+    return sl == std::string::npos ? p : p.substr(sl + 1);
+}
+
+// Al arrancar: ¿quedó una copia a medias?
+static void journal_check() {
+    FILE *f = fopen(JOURNAL, "r");
+    if (!f) return;
+    char path[FS_MAX_PATH + 8] = {0};
+    unsigned long long size = 0;
+    if (fgets(path, sizeof(path), f)) {
+        size_t n = strlen(path);
+        while (n && (path[n - 1] == '\n' || path[n - 1] == '\r')) path[--n] = 0;
+        if (fscanf(f, "%llu", &size) != 1) size = 0;
+    }
+    fclose(f);
+    journal_clear();
+    if (!path[0]) return;
+    struct stat st;
+    bool exists = stat(path, &st) == 0;
+    if (exists) unlink(path);
+    g_interrupted = base_name(path);
+    log_write("mtp: la copia anterior se corto en %s (%llu bytes): archivo a medias %s", path, size, exists ? "borrado" : "no estaba");
+}
+
+bool interrupted_file(char *out, size_t n) {
+    mutexLock(&g_status_mtx);
+    bool has = !g_interrupted.empty();
+    if (has) snprintf(out, n, "%s", g_interrupted.c_str());
+    mutexUnlock(&g_status_mtx);
+    return has;
+}
+void clear_interrupted() {
+    mutexLock(&g_status_mtx);
+    g_interrupted.clear();
+    mutexUnlock(&g_status_mtx);
+}
+static void set_interrupted(const std::string &name) {
+    mutexLock(&g_status_mtx);
+    g_interrupted = name;
+    mutexUnlock(&g_status_mtx);
+}
+
 // Crea el archivo/carpeta pedido por SendObjectInfo o SendObjectPropList y responde.
 static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name_in, u16 fmt, u64 size) {
     const std::string name = name_in.empty() ? name_in : safe_name(name_in);
@@ -858,6 +925,7 @@ static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string 
         if (fd >= 0) close(fd);
         log_debug("mtp: reservar %llu bytes: %s en %llu ms", (unsigned long long)size, fits ? "ok" : "fallo", (unsigned long long)((now_ns() - t) / 1000000));
         g_send.presized = fits;
+        if (fits) journal_set(path, size);
         if (!fits) {
             unlink(path.c_str());
             log_write("mtp: %s (%llu bytes) no cabe: errno %d", path.c_str(), (unsigned long long)size, e);
@@ -947,6 +1015,8 @@ static bool op_send_object(const Cmd &c) {
         return send_response(c.tid, RC_NoValidObjectInfo);
     }
     g_send.pending = false;
+    journal_set(g_send.path, g_send.size);
+    clear_interrupted();
     int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | (g_send.presized ? 0 : O_TRUNC), 0666);
     bool werr = fd < 0;
     if (fd < 0) log_write("mtp: SendObject: no se pudo crear %s (errno %d)", g_send.path.c_str(), errno);
@@ -994,6 +1064,14 @@ static bool op_send_object(const Cmd &c) {
     if (o) touch_save(*o);
     set_status("Conectado al PC");
     if (werr) notice("Error al escribir %s en la micro SD (¿llena?)", g_send.path.c_str());
+    if (!ok && !g_aborted) {
+        // se cortó el USB a mitad: no dejar un archivo a medias que parezca completo
+        unlink(g_send.path.c_str());
+        if (o) o->alive = false;
+        set_interrupted(base_name(g_send.path));
+        log_write("mtp: copia interrumpida (USB), borrado %s", g_send.path.c_str());
+    }
+    journal_clear();
     if (!ok) return false;
     return send_response(c.tid, werr ? RC_StoreFull : RC_OK);
 }
@@ -1287,6 +1365,7 @@ static Thread g_thread;
 Result start(std::atomic<bool> *quit) {
     g_quit = quit;
     mutexInit(&g_status_mtx);
+    journal_check();
     g_buf = (u8 *)memalign(0x1000, BUF_SIZE);
     g_buf2 = (u8 *)memalign(0x1000, BUF_SIZE);
     for (int i = 0; i < RX_N; i++) g_rx[i] = (u8 *)memalign(0x1000, RX_SIZE);

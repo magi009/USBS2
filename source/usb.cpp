@@ -339,15 +339,18 @@ bool rx_repost(int i) {
     return true;
 }
 
-bool rx_start(void *const *bufs, int n, u32 size) {
+bool rx_start(void *const *bufs, int n, u32 size, int post) {
     g_rxq.n = n > RXQ_MAX ? RXQ_MAX : n;
     g_rxq.size = size;
     g_rxq.head = 0;
     for (int i = 0; i < g_rxq.n; i++) { g_rxq.buf[i] = bufs[i]; g_rxq.posted[i] = false; }
-    for (int i = 0; i < g_rxq.n; i++)
+    if (post < 0 || post > g_rxq.n) post = g_rxq.n;
+    for (int i = 0; i < post; i++)
         if (!rx_repost(i)) return false;
     return true;
 }
+
+bool rx_posted(int i) { return i >= 0 && i < g_rxq.n && g_rxq.posted[i]; }
 
 void rx_stop() {
     bool any = false;

@@ -24,7 +24,8 @@ Status end_write(u32 timeout_ms = 0);
 void cancel_all();
 
 // Cola de lecturas PC -> consola: varias lecturas publicadas a la vez.
-bool rx_start(void *const *bufs, int n, u32 size);
+bool rx_start(void *const *bufs, int n, u32 size, int post = -1);   // post: cuántos publicar ya (-1 = todos)
+bool rx_posted(int idx);
 Status rx_wait(int *idx, u32 *got, u32 timeout_ms = 0);
 bool rx_repost(int idx);
 void rx_stop();

@@ -15,7 +15,7 @@
 #include "usb.h"
 #include "saves.h"
 
-#define APP_VER "1.9.6"
+#define APP_VER "1.10.0"
 
 // Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
 static int read_usb3() {
@@ -127,13 +127,14 @@ int main(int, char **) {
     log_write("    resultado USB: 0x%X", rc);
     if (R_FAILED(rc) && !g_log_verbose) log_enable(true);   // error: guardar el registro
 
-    char line[160], a[48], b[48], c[48];
+    char line[160], a[48], b[48], c[160];
     u64 bytes = 0, last_bytes = 0, last_tick = 0;
     double mbps = 0;
     while (appletMainLoop()) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         if (down & (HidNpadButton_Plus | HidNpadButton_B)) break;
+        if ((down & HidNpadButton_A) && R_SUCCEEDED(rc)) mtp::clear_interrupted();
         if (down & HidNpadButton_Y) {
             log_enable(!g_log_verbose);
             log_write("registro: %s (boton Y)", g_log_verbose ? "ACTIVADO" : "desactivado");
@@ -223,6 +224,14 @@ int main(int, char **) {
                 snprintf(line, sizeof(line), "%.1f MB/s   ·   quedan %s", mbps, mbps > 0.1 ? c : "…");
                 int lw = gfx::text_w(gfx::Body, line);
                 gfx::text(gfx::Body, 1190 - lw, 474, C_TEXT2, line);
+            } else if (mtp::interrupted_file(c, sizeof(c))) {
+                const char *cut = c;
+                gfx::text(gfx::Small, 90, 330, C_YEL1, "COPIA INTERRUMPIDA  ·  PARA REANUDAR");
+                snprintf(line, sizeof(line), "Se cortó en: %s", cut);
+                gfx::text(gfx::Body, 90, 358, C_WHITE, line, 1100);
+                gfx::text(gfx::Small, 90, 396, C_TEXT2, "Vuelve a copiar la misma carpeta o selección desde Windows y, cuando pregunte,");
+                gfx::text(gfx::Small, 90, 420, C_TEXT2, "elige \"Omitir\" para los archivos que ya están. Seguirá desde ese archivo.");
+                gfx::text(gfx::Small, 90, 450, C_TEXT3, "El archivo a medias ya se borró.   (A = ocultar este aviso)");
             } else if (mtp::get_notice(line, sizeof(line))) {
                 gfx::text(gfx::Small, 90, 334, C_RED, "AVISO");
                 gfx::text(gfx::Big, 90, 362, C_WHITE, line, 1100);
