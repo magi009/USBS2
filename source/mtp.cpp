@@ -1291,7 +1291,9 @@ Result start(std::atomic<bool> *quit) {
     g_buf2 = (u8 *)memalign(0x1000, BUF_SIZE);
     for (int i = 0; i < RX_N; i++) g_rx[i] = (u8 *)memalign(0x1000, RX_SIZE);
     g_cmd = (u8 *)memalign(0x1000, 0x1000);
-    if (!g_buf || !g_buf2 || !g_cmd || !g_rx[0] || !g_rx[1] || !g_rx[2]) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    bool rx_ok = true;
+    for (int i = 0; i < RX_N; i++) rx_ok &= g_rx[i] != nullptr;
+    if (!g_buf || !g_buf2 || !g_cmd || !rx_ok) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     mkdir("sdmc:/switch", 0777);
     Result rc = usb::init(quit);
     if (R_FAILED(rc)) { usb::exit(); return rc; }

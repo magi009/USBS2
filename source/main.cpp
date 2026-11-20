@@ -15,7 +15,7 @@
 #include "usb.h"
 #include "saves.h"
 
-#define APP_VER "1.9.5"
+#define APP_VER "1.9.6"
 
 // Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
 static int read_usb3() {
