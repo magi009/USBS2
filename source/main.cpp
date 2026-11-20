@@ -14,7 +14,7 @@
 #include "usb.h"
 #include "saves.h"
 
-#define APP_VER "1.9.0"
+#define APP_VER "1.9.1"
 
 // Lee usb!usb30_force_enabled: 0/1, o -1 si no se puede.
 static int read_usb3() {
@@ -203,6 +203,11 @@ int main(int, char **) {
                 snprintf(line, sizeof(line), "%.1f MB/s   ·   quedan %s", mbps, mbps > 0.1 ? c : "…");
                 int lw = gfx::text_w(gfx::Body, line);
                 gfx::text(gfx::Body, 1190 - lw, 474, C_TEXT2, line);
+            } else if (mtp::get_notice(line, sizeof(line))) {
+                gfx::text(gfx::Small, 90, 334, C_RED, "AVISO");
+                gfx::text(gfx::Big, 90, 362, C_WHITE, line, 1100);
+                gfx::text(gfx::Body, 90, 410, C_TEXT2, "Activa el registro con Y para ver los detalles.");
+                gfx::round_rect(90, 450, 1100, 26, 13, C_TRACK);
             } else {
                 gfx::text(gfx::Big, 90, 360, C_WHITE, "Sin copias en curso");
                 gfx::text(gfx::Body, 90, 404, C_TEXT2, "Copia o arrastra archivos desde el Explorador de Windows.");

@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 #---------------------------------------------------------------------------------
 APP_TITLE	:=	USBS2
 APP_AUTHOR	:=	USBS2
-APP_VERSION	:=	1.9.0
+APP_VERSION	:=	1.9.1
 
 TARGET		:=	USBS2
 BUILD		:=	build

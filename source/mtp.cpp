@@ -133,6 +133,28 @@ const char *link_name() {
     }
 }
 
+// Aviso importante para mostrar en pantalla (unos segundos).
+static char g_notice[160] = "";
+static u64 g_notice_ns = 0;
+static void notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void notice(const char *fmt, ...) {
+    mutexLock(&g_status_mtx);
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(g_notice, sizeof(g_notice), fmt, va);
+    va_end(va);
+    g_notice_ns = armTicksToNs(armGetSystemTick());
+    mutexUnlock(&g_status_mtx);
+    log_write("aviso: %s", g_notice);
+}
+bool get_notice(char *out, size_t n) {
+    mutexLock(&g_status_mtx);
+    bool fresh = g_notice[0] && armTicksToNs(armGetSystemTick()) - g_notice_ns < 20'000'000'000ULL;
+    if (fresh) snprintf(out, n, "%s", g_notice);
+    mutexUnlock(&g_status_mtx);
+    return fresh;
+}
+
 static void px_begin(int dir, const std::string &path, u64 total) {
     mutexLock(&g_status_mtx);
     size_t sl = path.rfind('/');
@@ -520,7 +542,9 @@ static bool send_data(const Cmd &c, const std::vector<u8> &payload) {
 // Recibe una fase de datos del PC. sink() recibe los trozos de carga útil
 // mientras ya se está recibiendo el siguiente trozo por USB (doble buffer).
 // false = USB muerto. Si el PC cancela, g_aborted = true.
-static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
+// expect: tamaño de los datos que se esperan (sin cabecera), si se conoce. Hace falta
+// para archivos de 4 GB o más: ahí el contenedor dice 0xFFFFFFFF ("desconocido").
+static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink, u64 expect = 0) {
     u32 got = 0;
     u8 *cur = nullptr;
     usb::Status st;
@@ -541,10 +565,12 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
         log_write("mtp: cancelado: primer bloque de datos de solo %u bytes (tipo %u)", got, got >= 6 ? rd16(cur + 4) : 0);
         return true;
     }
-    u32 len = rd32(cur);
-    bool unknown = len == 0xFFFFFFFF;
+    u32 len32 = rd32(cur);
+    u64 len = len32;
+    bool unknown = len32 == 0xFFFFFFFF;
+    if (unknown && expect) { len = expect + 12; unknown = false; }
     u64 recvd = got;
-    log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u, primer bloque %u", rd16(cur + 4), rd16(cur + 6), len, got);
+    log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u (%llu), primer bloque %u", rd16(cur + 4), rd16(cur + 6), len32, (unsigned long long)len, got);
     u32 cur_n = got, cur_off = 12;
     bool more = unknown ? got == RX_SIZE : recvd < len;
     bool ok = true;
@@ -555,9 +581,12 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink) {
         if (!more) break;
         u32 n = 0;
         u8 *nxt = nullptr;
-        st = rx_next(&nxt, &n, IO_TIMEOUT_MS);
+        // paquetes vacíos entre transferencias: se ignoran si aún faltan datos
+        do {
+            st = rx_next(&nxt, &n, IO_TIMEOUT_MS);
+        } while (st == usb::Status::Ok && n == 0 && !unknown);
         if (st == usb::Status::Error) return false;
-        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de enviar datos (llevaba %llu de %u bytes)", (unsigned long long)recvd, len); return true; }
+        if (st == usb::Status::Timeout) { g_aborted = true; log_write("mtp: cancelado: el PC dejo de enviar datos (llevaba %llu de %llu bytes)", (unsigned long long)recvd, (unsigned long long)len); return true; }
         if (n == 0) break;
         if (looks_like_command(nxt, n) && (unknown || len - recvd != n)) {
             memcpy(g_pending_cmd, nxt, n);
@@ -778,12 +807,13 @@ static bool op_delete(const Cmd &c) {
 }
 
 // estado entre SendObjectInfo y SendObject
-static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; } g_send;
+static struct { bool pending = false; u32 handle = 0; std::string path; u64 size = 0; bool presized = false; } g_send;
 
 // Crea el archivo/carpeta pedido por SendObjectInfo o SendObjectPropList y responde.
 static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string &name_in, u16 fmt, u64 size) {
     const std::string name = name_in.empty() ? name_in : safe_name(name_in);
     g_send.pending = false;
+    g_send.presized = false;
     if (name.empty() || name.find('/') != std::string::npos) return send_response(c.tid, RC_NoValidObjectInfo);
 
     Obj parent{st, -1, "", 0, true};
@@ -813,12 +843,31 @@ static bool create_object(const Cmd &c, u32 st, u32 parent_h, const std::string 
         if (mkdir(path.c_str(), 0777) != 0 && errno != EEXIST) return send_response(c.tid, RC_AccessDenied);
         touch_save(parent);
     }
+    if (fmt != FMT_Association && size >= 0x100000000ULL) {
+        // ¿Admite la micro archivos de 4 GB o más? (FAT32 no). Se prueba reservando el tamaño.
+        u64 t = now_ns();
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        bool fits = fd >= 0 && ftruncate(fd, (off_t)size) == 0;
+        int e = errno;
+        if (fd >= 0) close(fd);
+        log_debug("mtp: reservar %llu bytes: %s en %llu ms", (unsigned long long)size, fits ? "ok" : "fallo", (unsigned long long)((now_ns() - t) / 1000000));
+        g_send.presized = fits;
+        if (!fits) {
+            unlink(path.c_str());
+            log_write("mtp: %s (%llu bytes) no cabe: errno %d", path.c_str(), (unsigned long long)size, e);
+            if (e == ENOSPC) notice("No hay espacio para %s", name.c_str());
+            else notice("La micro SD no admite archivos de 4 GB o más (¿FAT32?): %s", name.c_str());
+            return send_response(c.tid, e == ENOSPC ? RC_StoreFull : 0xA809 /* Object_Too_Large */);
+        }
+    }
     u32 h = handle_for(st, parent.save, rel, parent_h);
     if (fmt != FMT_Association) {
         g_send.pending = true;
         g_send.handle = h;
         g_send.path = path;
         g_send.size = size;
+    } else {
+        g_send.presized = false;
     }
     // Como libhaze: carpeta padre 0 cuando el objeto queda en la raíz de la unidad.
     return send_response(c.tid, RC_OK, {st, parent_h, h});
@@ -892,17 +941,22 @@ static bool op_send_object(const Cmd &c) {
         return send_response(c.tid, RC_NoValidObjectInfo);
     }
     g_send.pending = false;
-    int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(g_send.path.c_str(), O_WRONLY | O_CREAT | (g_send.presized ? 0 : O_TRUNC), 0666);
     bool werr = fd < 0;
     if (fd < 0) log_write("mtp: SendObject: no se pudo crear %s (errno %d)", g_send.path.c_str(), errno);
     else log_debug("mtp: SendObject -> %s", g_send.path.c_str());
     // Reservar el tamaño final de una vez: la micro no tiene que ir agrandando el archivo.
-    bool presized = !werr && g_send.size && ftruncate(fd, (off_t)g_send.size) == 0;
+    u64 tr0 = now_ns();
+    bool presized = !werr && g_send.size && (g_send.presized || ftruncate(fd, (off_t)g_send.size) == 0);
+    log_debug("mtp: reservar tamano: %llu ms", (unsigned long long)((now_ns() - tr0) / 1000000));
+    if (!werr && g_send.size && !presized)
+        log_write("mtp: no se pudo reservar %llu bytes para %s (errno %d)", (unsigned long long)g_send.size, g_send.path.c_str(), errno);
     u64 written = 0, t0 = now_ns(), sd_ns = 0;
     set_status("Recibiendo %s", g_send.path.c_str());
     px_begin(1, g_send.path, g_send.size);
     bool ok = recv_data([&](const u8 *p, size_t n) {
         if (werr) return false;
+        if (written + n > g_send.size && g_send.size) n = g_send.size - written;   // nunca más de lo anunciado
         u64 t = now_ns();
         size_t done = 0;
         while (done < n) {
@@ -914,7 +968,7 @@ static bool op_send_object(const Cmd &c) {
         written += done;
         g_px_done = written;
         return !werr;
-    });
+    }, g_send.size);
     px_end(!g_aborted && !werr && ok);
     if (fd >= 0) {
         if (presized && !g_aborted && written != g_send.size) ftruncate(fd, (off_t)written);
@@ -929,9 +983,11 @@ static bool op_send_object(const Cmd &c) {
         unlink(g_send.path.c_str()); // copia cancelada: no dejar el archivo a medias
         if (o) o->alive = false;
         log_write("mtp: copia cancelada, borrado %s", g_send.path.c_str());
+        notice("Copia cancelada: %s", g_send.path.c_str() + (g_send.path.rfind('/') + 1));
     }
     if (o) touch_save(*o);
     set_status("Conectado al PC");
+    if (werr) notice("Error al escribir %s en la micro SD (¿llena?)", g_send.path.c_str());
     if (!ok) return false;
     return send_response(c.tid, werr ? RC_StoreFull : RC_OK);
 }
