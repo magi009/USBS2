@@ -568,7 +568,13 @@ static bool recv_data(const std::function<bool(const u8 *, size_t)> &sink, u64 e
     u32 len32 = rd32(cur);
     u64 len = len32;
     bool unknown = len32 == 0xFFFFFFFF;
-    if (unknown && expect) { len = expect + 12; unknown = false; }
+    // Con archivos de 4 GB o más, Windows pone un valor sin sentido en el largo del
+    // contenedor (visto: 11). Si sabemos el tamaño anunciado, manda ese.
+    if (expect && len != expect + 12) {
+        if (len32 != 0xFFFFFFFF) log_write("mtp: largo del contenedor %u no cuadra con el tamano anunciado %llu: se usa el anunciado", len32, (unsigned long long)expect);
+        len = expect + 12;
+        unknown = false;
+    }
     u64 recvd = got;
     log_debug("mtp: datos: contenedor tipo %u codigo 0x%04X largo %u (%llu), primer bloque %u", rd16(cur + 4), rd16(cur + 6), len32, (unsigned long long)len, got);
     u32 cur_n = got, cur_off = 12;
